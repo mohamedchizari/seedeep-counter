@@ -1,0 +1,6 @@
+# The versions the counter was last run with, on Python 3.9. Other versions were not tried.
+# OpenCV is the contrib build because mediapipe itself installs that one; two OpenCV packages would share cv2/.
+mediapipe==1.1.1
+opencv-contrib-python==5.0.0.93
+numpy==2.0.2
+reportlab==5.0.1

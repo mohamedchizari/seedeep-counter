@@ -1,0 +1,11 @@
+# fetched by fetch_assets.sh
+models/
+web/models/
+web/vendor/
+# outputs and local clutter
+out/
+.venv/
+venv/
+*.part
+__pycache__/
+.DS_Store

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SeeDeep counter</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="wrap">
+<h1>SeeDeep counter</h1>
+<p class="lead">Detection and counting in this browser. The model, the runtime and the sample clip are files from this server; the camera and any file you open stay in the page.</p>
+<div class="stage-grid">
+<div>
+<div class="stage"><video id="video" playsinline muted autoplay loop aria-label="Video with detections drawn over it"></video><canvas id="overlay" aria-hidden="true"></canvas><p id="status" class="status" role="status" aria-live="polite">Loading the detector.</p></div>
+<div class="controls">
+<button type="button" id="btn-sample" class="btn" aria-pressed="true">Sample clip</button>
+<button type="button" id="btn-camera" class="btn quiet" disabled>Use my camera</button>
+<button type="button" id="btn-file" class="btn quiet" disabled>Open a video file</button><input type="file" id="file" accept="video/*" aria-label="Choose a video file">
+<button type="button" id="btn-line" class="btn quiet" aria-pressed="false" disabled>Count crossings of a line</button>
+<button type="button" id="btn-zone" class="btn quiet" aria-pressed="false" disabled>Add a zone</button>
+<button type="button" id="btn-csv" class="btn quiet" disabled>Download the counts (CSV)</button>
+</div>
+<p class="legend"><span class="person">people</span><span class="vehicle">vehicles</span><span class="other">everything else it knows</span></p>
+</div>
+<aside class="counts">
+<h2>In the frame now</h2>
+<dl><dt>people</dt><dd class="big person" id="n-person">0</dd><dt>vehicles</dt><dd class="big vehicle" id="n-vehicle">0</dd><dt>other</dt><dd class="big" id="n-other">0</dd></dl>
+<dl id="x-row" hidden><dt>people crossed</dt><dd id="x-person">0 down, 0 up</dd><dt>vehicles crossed</dt><dd id="x-vehicle">0 down, 0 up</dd></dl>
+<dl id="z-row" hidden><dt>in the zone</dt><dd id="z-now">0</dd><dt>entered</dt><dd id="z-entered">0</dd><dt>mean stay</dt><dd id="z-stay">0 s</dd></dl>
+<div class="seen"><h2>Seen so far</h2><ul id="seen-list"></ul></div>
+<dl class="seen"><dt>frames a second</dt><dd id="m-fps">0</dd><dt>ms a detection</dt><dd id="m-ms">0</dd></dl>
+<button type="button" id="btn-copy" class="btn quiet">Copy these numbers</button>
+</aside>
+</div>
+<p class="note">Turn on the line and drag its ends, at any angle; add a zone and drag its corners. The line and the zone are remembered in this browser only. Counts can be wrong: see the README for the method and its limits.</p>
+</main>
+<script type="module" src="/js/seedeep.js"></script>
+</body>
+</html>
