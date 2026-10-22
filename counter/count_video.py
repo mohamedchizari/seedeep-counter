@@ -7,7 +7,12 @@ writes into OUT_DIR/.seedeep-counter-work: _annotated_raw.mp4 while it reads, th
 seen_by_class.csv, crossings.csv, summary.json, summary.pdf, which it moves into OUT_DIR at once (replacing an earlier run's);
 then annotated.mp4 (made from the raw file) and README.txt, moved last. .seedeep-counter-output in OUT_DIR lists what it put there.
 The model is fetched by ../fetch_assets.sh; ffmpeg (optional) re-encodes the annotated video to H.264."""
-import argparse, contextlib, csv, hashlib, json, os, signal, sys, time, subprocess, datetime, shutil
+import os, signal, sys
+
+GOT = []  # the stops this run has had, noted from the start: a library can swallow the exception a signal raised, so the run also checks this
+
+def _early_int(n, f):
+    GOT.append(n); raise KeyboardInterrupt
 
 def ctrl_c():
     """Ctrl-C: one line instead of a traceback, then the end a parent expects from Ctrl-C (killed by SIGINT; exit 130 on Windows)."""
@@ -16,10 +21,12 @@ def ctrl_c():
     sys.exit(130)
 
 try:
-    import fcntl  # locks the output folder while a run writes into it; Windows has no fcntl, and there a second run is not stopped
-except ImportError:
-    fcntl = None
-try:
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler: signal.signal(signal.SIGINT, _early_int)  # an ignored Ctrl-C stays ignored
+    import argparse, contextlib, csv, hashlib, json, stat, time, subprocess, datetime, shutil
+    try:
+        import fcntl  # locks the output folder while a run writes into it; Windows has no fcntl, and there a second run is not stopped
+    except ImportError:
+        fcntl = None
     import cv2, numpy as np
     import mediapipe as mp
     from mediapipe.tasks import python as mptasks
@@ -29,8 +36,10 @@ try:
     except ImportError:
         reportlab = None
     from tracker import Tracker, group, VEHICLES
-except KeyboardInterrupt:
-    ctrl_c()
+except BaseException as e:  # a Ctrl-C during the imports ends the run, also when a library swallowed or replaced its exception
+    if GOT or isinstance(e, KeyboardInterrupt): ctrl_c()
+    raise
+if GOT: ctrl_c()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, '..', 'models', 'efficientdet_lite0.tflite')
@@ -44,9 +53,11 @@ TAG_TEXT = 'Made by count_video.py for one run. The next run into the folder abo
 LITE0_SHA256 = '4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993'  # efficientdet_lite0.tflite, as fetch_assets.sh checks it
 
 def listed(out):
-    """The files the mark in OUT_DIR says this program put there: {name: (size, modified time in ns)}; {} without a mark."""
+    """The files the mark in OUT_DIR says this program put there: {name: (size, modified time in ns)}; {} without a mark, None
+    when the mark is there but cannot be read."""
     try: rows = open(os.path.join(out, MARK), encoding='utf-8', errors='replace').read().splitlines()[1:]
-    except OSError: return {}
+    except FileNotFoundError: return {}
+    except OSError: return None
     return {r[0]: (int(r[1]), int(r[2])) for r in (row.split('\t') for row in rows) if len(r) == 3 and r[1].isascii() and r[1].isdigit() and r[2].isascii() and r[2].isdigit()}
 
 def stamp(path):
@@ -66,38 +77,79 @@ def has_entries(folder):
     try: return bool(os.listdir(folder))
     except OSError: return True
 
-def write_tag(work):
-    """Writes the work folder's tag file, never through a link: a link in its place is deleted first, and the file is opened
-    without following one (where the system can)."""
-    tag = os.path.join(work, WORK_TAG)
-    if os.path.islink(tag): os.remove(tag)
-    fd = os.open(tag, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o644)
-    with os.fdopen(fd, 'w', encoding='utf-8') as f: f.write(TAG_TEXT)
+# Where the system can (not on Windows), a work folder is opened without following a link and what is in it is reached through
+# that descriptor, so a link put in its place, or in it, is never followed; elsewhere its path is checked before each use.
+DIR_FD = (hasattr(os, 'O_DIRECTORY') and hasattr(os, 'O_NOFOLLOW') and os.scandir in os.supports_fd and os.stat in os.supports_follow_symlinks
+          and all(f in os.supports_dir_fd for f in (os.open, os.stat, os.unlink, os.rmdir, os.rename)))
+DIR_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
 
-def clear_work(work, tries=3):
+def write_tag(work, fd=None):
+    """Writes the work folder's tag file, never through a link: a link in its place is deleted first, and the file is opened
+    without following one (where the system can); with fd, inside the folder open as fd."""
+    if fd is not None:
+        with contextlib.suppress(FileNotFoundError):
+            if stat.S_ISLNK(os.stat(WORK_TAG, dir_fd=fd, follow_symlinks=False).st_mode): os.unlink(WORK_TAG, dir_fd=fd)
+        t = os.open(WORK_TAG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+    else:
+        tag = os.path.join(work, WORK_TAG)
+        if os.path.islink(tag): os.remove(tag)
+        t = os.open(tag, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o644)
+    with os.fdopen(t, 'w', encoding='utf-8') as f: f.write(TAG_TEXT)
+
+def _empty(fd, keep=None):
+    """Deletes everything in the folder open as fd but keep, through descriptors: a link in it is deleted, never followed."""
+    for e in list(os.scandir(fd)):
+        if e.name == keep: continue
+        if e.is_dir(follow_symlinks=False):
+            sub = os.open(e.name, DIR_FLAGS, dir_fd=fd)
+            try: _empty(sub)
+            finally: os.close(sub)
+            os.rmdir(e.name, dir_fd=fd)
+        else: os.unlink(e.name, dir_fd=fd)
+
+def clear_work(work, tries=3, expect=None):
     """Deletes a work folder this program made: everything else first, its tag last, then the empty folder. A stop part way
-    leaves the folder tagged or empty, and a later run deletes either. If that fails (a file that appears meanwhile, such as
-    a .DS_Store, or one that cannot be deleted), the tag is written back and it is tried again; False if the folder stays."""
-    tag = os.path.join(work, WORK_TAG)
+    leaves the folder tagged or empty, and a later run deletes either. Where the system can, the folder is opened without
+    following a link, must be the folder expect names (its device and inode) when given, and is emptied through that
+    descriptor, so nothing outside it is touched. If deleting fails (a file that appears meanwhile, such as a .DS_Store, or one
+    that cannot be deleted), the tag is written back and it is tried again; False if the folder stays."""
     for _ in range(tries):
-        try:
-            for e in os.scandir(work):
-                if e.name == WORK_TAG: continue
-                if e.is_dir(follow_symlinks=False): shutil.rmtree(e.path)
-                else: os.remove(e.path)
-            if os.path.lexists(tag): os.remove(tag)
-            os.rmdir(work); return True
-        except OSError:
-            if not os.path.lexists(work): return True
-            with contextlib.suppress(OSError): write_tag(work)
+        if DIR_FD:
+            try: fd = os.open(work, DIR_FLAGS)
+            except FileNotFoundError: return True
+            except OSError: return False  # a link, not a folder, or one that cannot be opened: left alone
+            try:
+                st = os.fstat(fd)
+                if expect is not None and (st.st_dev, st.st_ino) != expect: return False
+                _empty(fd, keep=WORK_TAG)
+                with contextlib.suppress(FileNotFoundError): os.unlink(WORK_TAG, dir_fd=fd)
+                now = os.lstat(work)
+                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino): return False  # replaced meanwhile: left alone
+                os.rmdir(work); return True
+            except OSError:
+                with contextlib.suppress(OSError): write_tag(work, fd)
+            finally: os.close(fd)
+        else:
+            tag = os.path.join(work, WORK_TAG)
+            try:
+                st = os.lstat(work)
+                if not stat.S_ISDIR(st.st_mode) or (expect is not None and (st.st_dev, st.st_ino) != expect): return False
+                for e in os.scandir(work):
+                    if e.name == WORK_TAG: continue
+                    if e.is_dir(follow_symlinks=False): shutil.rmtree(e.path)
+                    else: os.remove(e.path)
+                if os.path.lexists(tag): os.remove(tag)
+                os.rmdir(work); return True
+            except OSError:
+                if not os.path.lexists(work): return True
+                with contextlib.suppress(OSError): write_tag(work)
     return False
 
 STOPS = [getattr(signal, n) for n in ('SIGINT', 'SIGTERM', 'SIGHUP') if hasattr(signal, n)]  # Windows has no SIGHUP
 
-GOT = []  # the stops this run has had: a library can swallow the exception a signal raised, so the run also checks this
-
 def stop_here(n, f):
-    """SIGTERM and SIGHUP end the run as Ctrl-C does: by an exception, so the ffmpeg it started is stopped (see the video step)."""
+    """SIGTERM and SIGHUP end the run as Ctrl-C does: by an exception, so the ffmpeg it started is stopped (see the video step),
+    then (outside Windows) by the signal itself, at the end of the file."""
     GOT.append(n); raise SystemExit(128 + n)
 
 def on_ctrl_c(n, f):
@@ -136,7 +188,7 @@ def main():
     ap.add_argument('--no-video', action='store_true'); a = ap.parse_args()
     for sig in STOPS[1:]:
         if signal.getsignal(sig) == signal.SIG_DFL: signal.signal(sig, stop_here)  # one the caller ignores stays ignored: nohup ignores SIGHUP
-    if signal.getsignal(signal.SIGINT) is signal.default_int_handler: signal.signal(signal.SIGINT, on_ctrl_c)  # an ignored Ctrl-C stays ignored
+    if signal.getsignal(signal.SIGINT) in (signal.default_int_handler, _early_int): signal.signal(signal.SIGINT, on_ctrl_c)  # an ignored Ctrl-C stays ignored
     for v, what in ((a.inp, 'the input file name'), (a.out, 'the OUT_DIR name'), (a.model, 'the --model path'), (a.ffmpeg, 'the --ffmpeg name'), (a.title, '--title'), (a.line_text, '--line-text')):
         try: v.encode('utf-8')
         except UnicodeEncodeError: ap.error(what + ' is not valid UTF-8 (OpenCV or the outputs would fail on it) - change it')
@@ -147,6 +199,8 @@ def main():
     if reportlab is None: print('ReportLab is not installed (pip install -r counter/requirements.txt)'); sys.exit(2)
     OUTPUTS = ('counts_per_second.csv', 'counts_per_minute.csv', 'seen_by_class.csv', 'crossings.csv', 'summary.json', 'summary.pdf', 'annotated.mp4', 'README.txt', '_annotated_raw.mp4')
     if not a.out or (os.path.lexists(a.out) and not os.path.isdir(a.out)): ap.error('OUT_DIR must be a folder: ' + repr(a.out))
+    if os.path.exists(a.inp) and not stat.S_ISREG(os.stat(a.inp).st_mode):  # a FIFO would hold OpenCV, and the run, past any stop
+        print(a.inp, 'is not a regular file (a folder, a FIFO or a device) - give a video file'); sys.exit(2)
     cap = cv2.VideoCapture(a.inp)
     if not cap.isOpened(): print('cannot open', a.inp); sys.exit(2)
     opts = vision.ObjectDetectorOptions(base_options=mptasks.BaseOptions(model_asset_path=a.model), running_mode=vision.RunningMode.VIDEO, score_threshold=0.4, max_results=25)
@@ -154,10 +208,11 @@ def main():
     except Exception as e: print('the detector could not be made from', a.model, '-', str(e)[:200]); sys.exit(2)
     check_stop(); lite0 = hashlib.sha256(open(a.model, 'rb').read()).hexdigest() == LITE0_SHA256  # only this model is named EfficientDet-Lite0 in the outputs
     model = os.path.basename(a.model) + (' (EfficientDet-Lite0, float16)' if lite0 else '')
-    out_abs = up = os.path.abspath(a.out); made_top = None  # the folders this run makes (OUT_DIR and any missing above it) are
-    while not os.path.lexists(up) and os.path.dirname(up) != up: made_top, up = up, os.path.dirname(up)  # deleted again if it reads no frame
-    try: os.makedirs(a.out, exist_ok=True)
+    out_abs = up = os.path.realpath(a.out); made_top = None  # the folders this run makes (OUT_DIR and any missing above it) are deleted
+    while not os.path.lexists(up) and os.path.dirname(up) != up: made_top, up = up, os.path.dirname(up)  # again if it reads no frame
+    try: os.makedirs(out_abs, exist_ok=True)  # the resolved path, the same one recorded above (x/../y makes y, not x)
     except OSError as e: ap.error('OUT_DIR cannot be made: ' + str(e))
+    a.out = out_abs
     if fcntl:  # taken before the folder is looked at and held until this run ends (the system lets go of it even if the run is killed), so a second run into OUT_DIR meanwhile is refused
         try: lock = os.open(a.out, os.O_RDONLY)
         except OSError as e: print(a.out, 'cannot be opened:', e.strerror or e, '- check its permissions, or choose another output folder'); sys.exit(2)
@@ -172,6 +227,7 @@ def main():
     if os.path.exists(a.inp) and any(os.path.samefile(a.inp, os.path.join(a.out, n)) for n in present):  # the same file however it is spelled
         print('the input is one of the files this run writes in', a.out, '- choose another output folder'); sys.exit(2)
     marks = listed(a.out)
+    if marks is None: print(a.out, 'holds', MARK, 'but it cannot be read - check its permissions, or choose another output folder'); sys.exit(2)
     def ours(name):  # the file under that name in OUT_DIR is one this program put there, unchanged in size and modified time since
         p = os.path.join(a.out, name); return os.path.isfile(p) and not os.path.islink(p) and marks.get(name) == stamp(p)
     foreign = [n for n in present if not ours(n)]
@@ -187,15 +243,40 @@ def main():
     if os.path.isdir(work) and not clear_work(work):  # what a stopped run left: tagged or empty (checked above)
         print(work, 'could not be deleted (it cannot be listed, or a file in it cannot be deleted or keeps coming back) - check it, or choose another output folder'); sys.exit(2)
     try:
-        os.makedirs(work); write_tag(work)
+        os.mkdir(work)
+        wfd = os.open(work, DIR_FLAGS) if DIR_FD else None  # the folder this run made, held open: its files are reached through it
+        st = os.fstat(wfd) if wfd is not None else os.lstat(work); work_id = (st.st_dev, st.st_ino)
+        write_tag(work, wfd)
     except OSError as e: print(a.out, 'cannot be written:', e.strerror or e, '- choose another output folder'); sys.exit(2)
+    def still_ours():
+        """Ends the run (exit 2) if the work folder is no longer the one this run made (a link put in its place, say)."""
+        try: st = os.lstat(work); same = stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == work_id
+        except OSError: same = False
+        if not same:
+            print(work, 'was replaced during this run (it is no longer the folder this run made) - nothing more is written there or deleted; check', a.out, flush=True); sys.exit(2)
+    def wopen(name, mode='w', check=True, **kw):  # a file in this run's work folder, opened through the folder itself where the system can
+        if check or wfd is None: still_ours()
+        if wfd is None: return open(os.path.join(work, name), mode, **kw)
+        return open(name, mode, opener=lambda p, fl: os.open(p, fl | os.O_NOFOLLOW, 0o644, dir_fd=wfd), **kw)
+    def wexists(name):
+        try:
+            if wfd is None: os.lstat(os.path.join(work, name))
+            else: os.stat(name, dir_fd=wfd, follow_symlinks=False)
+            return True
+        except FileNotFoundError: return False
+    def wremove(name):
+        if wfd is None: still_ours(); os.remove(os.path.join(work, name))
+        else: os.unlink(name, dir_fd=wfd)
+    def wmove(name, dst, inside=False):  # into OUT_DIR, or (inside) to another name in the work folder
+        if wfd is None: still_ours(); os.replace(os.path.join(work, name), os.path.join(work, dst) if inside else dst)
+        else: os.replace(name, dst, src_dir_fd=wfd, dst_dir_fd=wfd if inside else None)
     raw, final = os.path.join(work, '_annotated_raw.mp4'), os.path.join(work, 'annotated.mp4')
     fps = cap.get(cv2.CAP_PROP_FPS) or 25; W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     limit = a.max_minutes * 60  # stop at the end of the file or here; the frame count in a file's header can be wrong or negative
     line_y = H * a.line if a.line else 0
     writer = None
     if not a.no_video:
-        writer = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), fps / a.every, (W, H))
+        still_ours(); writer = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), fps / a.every, (W, H))
         if not writer.isOpened(): print('the annotated video cannot be written here; going on without it', flush=True); writer = None
     per_sec = {}; per_min = {}; frames = 0; i = 0; t0 = time.time(); inf_ms = []; last_ms = -1
     while True:
@@ -222,7 +303,9 @@ def main():
     cap.release(); dur = i / fps
     if frames == 0:
         if writer is not None: writer.release()
-        if clear_work(work) and made_top:
+        still_ours()
+        if not clear_work(work, expect=work_id): print(work, 'could not be deleted (it cannot be listed, a file in it cannot be deleted or keeps coming back, or it was replaced); the next run into', a.out, 'tries again', flush=True)
+        elif made_top:
             d = out_abs  # the folders this run made, from OUT_DIR up, each only if nothing else is in it
             while True:
                 try: os.rmdir(d)
@@ -232,19 +315,19 @@ def main():
         print('no frames could be read from', a.inp, "- an earlier run's outputs are left as they were"); sys.exit(3)
     if writer is not None: writer.release()
     # tables
-    with open(os.path.join(work, 'counts_per_second.csv'), 'w', newline='', encoding='utf-8') as f:
+    with wopen('counts_per_second.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f); w.writerow(['second', 'people_in_frame_max', 'vehicles_in_frame_max', 'other_in_frame_max', 'frames_seen'])
         for s in sorted(per_sec): r = per_sec[s]; w.writerow([s, r['person'], r['vehicle'], r['other'], r['frames']])
     ev_by_min = {}
     for (t_s, g, cls, d, tid) in tr.events: ev_by_min.setdefault(int(t_s) // 60, {'person_down': 0, 'person_up': 0, 'vehicle_down': 0, 'vehicle_up': 0})[f'{g}_{d}'] += 1
-    with open(os.path.join(work, 'counts_per_minute.csv'), 'w', newline='', encoding='utf-8') as f:
+    with wopen('counts_per_minute.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f); w.writerow(['minute', 'people_in_frame_max', 'people_in_frame_mean', 'vehicles_in_frame_max', 'vehicles_in_frame_mean', 'people_crossed_down', 'people_crossed_up', 'vehicles_crossed_down', 'vehicles_crossed_up', 'frames_seen'])
         for m in sorted(per_min):
             r = per_min[m]; e = ev_by_min.get(m, {'person_down': 0, 'person_up': 0, 'vehicle_down': 0, 'vehicle_up': 0})
             w.writerow([m, r['person_max'], round(r['person_sum'] / max(1, r['frames']), 2), r['vehicle_max'], round(r['vehicle_sum'] / max(1, r['frames']), 2), e['person_down'], e['person_up'], e['vehicle_down'], e['vehicle_up'], r['frames']])
-    with open(os.path.join(work, 'seen_by_class.csv'), 'w', newline='', encoding='utf-8') as f:
+    with wopen('seen_by_class.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f); w.writerow(['class', 'group', 'tracks_seen']); [w.writerow([c, group(c), n]) for c, n in sorted(tr.seen.items(), key=lambda x: -x[1])]
-    with open(os.path.join(work, 'crossings.csv'), 'w', newline='', encoding='utf-8') as f:
+    with wopen('crossings.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f); w.writerow(['second', 'group', 'class', 'direction', 'track_id']); [w.writerow([round(t, 2), g, c, d, tid]) for (t, g, c, d, tid) in tr.events]
     peak_p = max(per_sec.items(), key=lambda kv: kv[1]['person'], default=(0, {'person': 0})); peak_v = max(per_sec.items(), key=lambda kv: kv[1]['vehicle'], default=(0, {'vehicle': 0}))
     summary = {'input': os.path.basename(a.inp), 'title': a.title, 'made': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'width': W, 'height': H, 'fps': round(fps, 3), 'duration_s': round(dur, 2), 'frames_processed': frames, 'every_nth_frame': a.every,
@@ -252,40 +335,45 @@ def main():
                'ms_per_detection_mean': round(float(np.mean(inf_ms)), 1) if inf_ms else None, 'seen': tr.seen, 'people_seen': sum(n for c, n in tr.seen.items() if c == 'person'), 'vehicles_seen': sum(n for c, n in tr.seen.items() if c in VEHICLES),
                'crossings': {'person': {'down': tr.cross['person'][0], 'up': tr.cross['person'][1]}, 'vehicle': {'down': tr.cross['vehicle'][0], 'up': tr.cross['vehicle'][1]}},
                'peak_people_in_frame': {'count': peak_p[1]['person'], 'second': peak_p[0]}, 'peak_vehicles_in_frame': {'count': peak_v[1]['vehicle'], 'second': peak_v[0]}}
-    with open(os.path.join(work, 'summary.json'), 'w', encoding='utf-8') as f: json.dump(summary, f, indent=1, ensure_ascii=False)
+    with wopen('summary.json', 'w', encoding='utf-8') as f: json.dump(summary, f, indent=1, ensure_ascii=False)
     has_pdf = False
     try:
-        pdf(summary, per_min, ev_by_min, os.path.join(work, 'summary.pdf'), video=writer is not None, lite0=lite0); has_pdf = True
+        with wopen('summary.pdf', 'wb') as f: pdf(summary, per_min, ev_by_min, f, video=writer is not None, lite0=lite0)
+        has_pdf = True
     except Exception as e:  # the tables and the video still count without the PDF
         print('summary.pdf could not be written:', e, flush=True)
-        if os.path.exists(os.path.join(work, 'summary.pdf')): os.remove(os.path.join(work, 'summary.pdf'))
+        if wexists('summary.pdf'): wremove('summary.pdf')
     kept = []  # output names whose file in OUT_DIR changed during this run: left as they are
     def put(new, old=()):
         """This run's files named in new go into place. For the other names (those in old, and a name in new for which this
         run made no file, such as summary.pdf when the PDF could not be written) the file an earlier run put there is deleted.
         Then the mark lists what this program has put in OUT_DIR. A file there that is not ours (see above) is left alone."""
+        still_ours()
         with no_stop():
             for name in [*new, *old]:
-                src, dst = os.path.join(work, name), os.path.join(a.out, name)
+                dst = os.path.join(a.out, name)
                 if os.path.lexists(dst) and not ours(name): kept.append(name)
-                elif name in new and os.path.exists(src): os.replace(src, dst); marks[name] = stamp(dst)
+                elif name in new and wexists(name): wmove(name, dst); marks[name] = stamp(dst)
                 elif os.path.lexists(dst): os.remove(dst)
             kept.extend(n for n in OUTPUTS if n in marks and os.path.lexists(os.path.join(a.out, n)) and not ours(n))  # changed since this run moved it
-            with open(os.path.join(work, MARK), 'w', encoding='utf-8') as f:
+            with wopen(MARK, 'w', check=False, encoding='utf-8') as f:
                 f.write('This folder holds the outputs of count_video.py. A new run into it replaces or deletes the files listed here (name, size, modified time in ns), and only while their size and modified time are unchanged.\n')
                 f.writelines(f'{n}\t{marks[n][0]}\t{marks[n][1]}\n' for n in OUTPUTS if ours(n))
-            os.replace(os.path.join(work, MARK), os.path.join(a.out, MARK))
+            wmove(MARK, os.path.join(a.out, MARK))
     # the tables, the summary and the PDF go into place before the video step, so a video step that fails or is stopped cannot
     # cost them; an earlier run's video and README.txt are deleted at the same time, so they cannot sit beside this run's tables
     check_stop(); put(['counts_per_second.csv', 'counts_per_minute.csv', 'seen_by_class.csv', 'crossings.csv', 'summary.json', 'summary.pdf'], ['annotated.mp4', 'README.txt', '_annotated_raw.mp4'])
     # the annotated video: re-encoded to H.264 when an ffmpeg is found and works, else kept as written (MPEG-4 Part 2)
-    check_stop()
-    if writer is not None and os.path.exists(raw):
+    check_stop(); still_ours()
+    if writer is not None and wexists('_annotated_raw.mp4'):
         encoded = False
         if ff:
             try:
-                p = subprocess.Popen([ff, '-nostdin', '-y', '-loglevel', 'error', '-i', raw, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', final])  # in the run's process group, so a stop sent to the group reaches it too
-                try: encoded = p.wait(timeout=max(FFMPEG_MIN_TIMEOUT_S, 10 * dur)) == 0 and os.path.exists(final)
+                here = wfd is not None and os.name == 'posix'  # ffmpeg works inside the folder this run made, entered through its descriptor
+                src, dst = ('_annotated_raw.mp4', 'annotated.mp4') if here else (raw, final)
+                p = subprocess.Popen([os.path.abspath(ff) if here else ff, '-nostdin', '-y', '-loglevel', 'error', '-i', src, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', dst],
+                                     preexec_fn=(lambda: os.fchdir(wfd)) if here else None)  # in the run's process group, so a stop sent to the group reaches it too
+                try: encoded = p.wait(timeout=max(FFMPEG_MIN_TIMEOUT_S, 10 * dur)) == 0 and wexists('annotated.mp4')
                 except BaseException:  # the time limit, Ctrl-C, SIGTERM or SIGHUP: the ffmpeg ends too (not what a wrapper script started)
                     with contextlib.suppress(OSError): p.kill()
                     p.wait(); raise
@@ -295,18 +383,21 @@ def main():
                 print('ffmpeg ran longer than', round(max(FFMPEG_MIN_TIMEOUT_S, 10 * dur)), 's and was stopped', flush=True)
             if not encoded: print('ffmpeg did not make the H.264 video; the annotated video stays MPEG-4 Part 2', flush=True)
         elif a.ffmpeg: print('ffmpeg not found (' + a.ffmpeg + '); the annotated video stays MPEG-4 Part 2', flush=True)
-        if encoded: os.remove(raw)
+        still_ours()
+        if encoded: wremove('_annotated_raw.mp4')
         else:
-            if os.path.exists(final): os.remove(final)
-            os.rename(raw, final)
-    with open(os.path.join(work, 'README.txt'), 'w', encoding='utf-8') as f: f.write('SeeDeep video counts\n\ncounts_per_second.csv: the most people, vehicles and other things in frame in each second.\ncounts_per_minute.csv: per minute, the most and the average in frame, and the line crossings.\nseen_by_class.csv: how many tracks of each class reached 3 hits ("seen"; a thing the detector loses for more than 12 of the frames looked at and finds again is counted again each time; two things close together can be seen as one, and two that pass each other can swap tracks).\ncrossings.csv: every crossing of the line with its time, direction and track.\n' + ('annotated.mp4: the video with the boxes and the line drawn.\n' if os.path.exists(final) else '') + ('summary.json: the totals and the peaks; summary.pdf: the same, with the method and its limits.\n\n' if has_pdf else 'summary.json: the totals and the peaks.\n\n') + 'Detector: MediaPipe, model ' + model + ('; Apache 2.0, 80 COCO classes' if lite0 else '') + '; it does not read faces, plates or text. Counts can be wrong' + ('; the annotated video is there so you can judge' if os.path.exists(final) else '') + '.\n')
+            if wexists('annotated.mp4'): wremove('annotated.mp4')
+            wmove('_annotated_raw.mp4', 'annotated.mp4', inside=True)
+    has_video = wexists('annotated.mp4')
+    with wopen('README.txt', 'w', encoding='utf-8') as f: f.write('SeeDeep video counts\n\ncounts_per_second.csv: the most people, vehicles and other things in frame in each second.\ncounts_per_minute.csv: per minute, the most and the average in frame, and the line crossings.\nseen_by_class.csv: how many tracks of each class reached 3 hits ("seen"; a thing the detector loses for more than 12 of the frames looked at and finds again is counted again each time; two things close together can be seen as one, and two that pass each other can swap tracks).\ncrossings.csv: every crossing of the line with its time, direction and track.\n' + ('annotated.mp4: the video with the boxes' + (' and the line' if line_y else '') + ' drawn.\n' if has_video else '') + ('summary.json: the totals and the peaks; summary.pdf: the same, with the method and its limits.\n\n' if has_pdf else 'summary.json: the totals and the peaks.\n\n') + 'Detector: MediaPipe, model ' + model + ('; Apache 2.0, 80 COCO classes' if lite0 else '') + '; it does not read faces, plates or text. Counts can be wrong' + ('; the annotated video is there so you can judge' if has_video else '') + '.\n')
     put(['annotated.mp4', 'README.txt'])  # last, after the video step
     if kept: print('left as they were, as they changed in', a.out, "during this run (before or after this run's file of that name was moved in):", ', '.join(dict.fromkeys(kept)), '- they are not listed in', MARK, flush=True)
-    if not clear_work(work): print(work, 'could not be deleted (it cannot be listed, or a file in it cannot be deleted or keeps coming back); the next run into', a.out, 'tries again', flush=True)
+    still_ours()
+    if not clear_work(work, expect=work_id): print(work, 'could not be deleted (it cannot be listed, or a file in it cannot be deleted or keeps coming back); the next run into', a.out, 'tries again', flush=True)
     print(json.dumps({k: summary[k] for k in ('frames_processed', 'duration_s', 'ms_per_detection_mean', 'people_seen', 'vehicles_seen', 'crossings', 'peak_people_in_frame')}))
     if kept: sys.exit(4)  # some files in OUT_DIR changed during this run (above)
 
-def pdf(s, per_min, ev, path, video=False, lite0=True):
+def pdf(s, per_min, ev, path, video=False, lite0=True):  # path: a file name or an open binary file
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import inch
@@ -368,3 +459,8 @@ def pdf(s, per_min, ev, path, video=False, lite0=True):
 if __name__ == '__main__':
     try: main()
     except KeyboardInterrupt: ctrl_c()
+    except SystemExit:  # a SIGTERM or SIGHUP: end by that signal, as Ctrl-C does, so no thread a library started can hold up the exit
+        if GOT and os.name == 'posix':
+            if GOT[0] == signal.SIGINT: ctrl_c()
+            sys.stdout.flush(); sys.stderr.flush(); signal.signal(GOT[0], signal.SIG_DFL); os.kill(os.getpid(), GOT[0])
+        raise

@@ -1,4 +1,4 @@
-// SeeDeep, version 2.12: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
+// SeeDeep, version 2.13: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
 // WebAssembly runtime and the sample clip are files from the server that serves this page; the camera and any opened file stay in the page.
 // Detector: MediaPipe Tasks Vision (Apache 2.0), EfficientDet-Lite0 (80 COCO classes). Tracking, the line, the zone and the
 // counting: this file. The line can be dragged by its two ends; a zone (a polygon with draggable corners) counts who is inside and for how long.
@@ -86,9 +86,10 @@ function hasWebGL() {
     return kinds.some(glOn);
   } catch (e) { return true; } // a check that fails says nothing; let the detector try
 }
+const NO_GL = "this browser gives the page no WebGL (it is off, or there is none)";
 async function load() {
   LOADING = "Loading the detector (about 17 MB, once)."; say("");
-  if (!hasWebGL()) throw new Error("this browser gives the page no WebGL (it is off, or there is none)");
+  if (!hasWebGL()) throw new Error(NO_GL);
   const { FilesetResolver, ObjectDetector } = await import("/vendor/vision_bundle.mjs");
   const vision = await FilesetResolver.forVisionTasks("/vendor/wasm");
   const opts = (delegate) => ({ baseOptions: { modelAssetPath: "/models/efficientdet_lite0.tflite", delegate }, scoreThreshold: 0.4, maxResults: 25, runningMode: "VIDEO" });
@@ -290,4 +291,4 @@ running = true; requestAnimationFrame(loop);
 applyConfig().then(() => { $("btn-line").setAttribute("aria-pressed", String(lineOn)); $("x-row").hidden = !lineOn; window.__seedeep.lineOn = lineOn; window.__seedeep.line = line; if (zone) { $("btn-zone").setAttribute("aria-pressed", "true"); $("btn-zone").textContent = "Remove the zone"; $("z-row").hidden = false; window.__seedeep.zone = zone; } })
   .then(load).then(() => (CONFIG && CONFIG.start === "camera" ? useCamera() : useSample()))
   .catch((e) => { LOADING = ""; const why = e && e.message ? e.message.slice(0, 120).replace(/[.\s]+$/, "") : e && e.target && e.target.src ? new URL(e.target.src).pathname + " did not load" : String(e);
-    NOTE = "The detector could not load: " + why + ". A browser with WebAssembly and WebGL is needed; if you serve this page yourself, run fetch_assets.sh first." + (NOTE ? " " + NOTE : ""); say(""); }); // kept, so "Sample clip" does not clear it
+    NOTE = "The detector could not load: " + why + (e && e.message === NO_GL ? ". This page needs WebGL." : ". A browser with WebAssembly and WebGL is needed; if you serve this page yourself, run fetch_assets.sh first.") + (NOTE ? " " + NOTE : ""); say(""); }); // kept, so "Sample clip" does not clear it

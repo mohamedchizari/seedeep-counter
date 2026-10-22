@@ -5,7 +5,8 @@
 # mediapipe 0.10.32 has wheels for macOS on Apple silicon, Linux x86_64 (glibc 2.28 or later) and Windows x86_64 only, so it
 # does not install on an Intel Mac, on Linux on ARM or on Windows on ARM; OpenCV 5.0.0.93's wheel for Apple silicon needs
 # macOS 13 or later. OpenCV is the contrib build because mediapipe itself installs that one; two OpenCV packages would share
-# cv2/.
+# cv2/. mediapipe also installs absl-py, flatbuffers, matplotlib and sounddevice, not pinned here (sounddevice runs ldconfig,
+# gcc and ld to look for PortAudio when it is imported).
 mediapipe==0.10.32
 opencv-contrib-python==5.0.0.93
 numpy==2.0.2

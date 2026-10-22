@@ -20,7 +20,12 @@ get() { # url, destination, expected sha256
 }
 
 get "$MODEL_URL" models/efficientdet_lite0.tflite 4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993
-mkdir -p web/models && cp models/efficientdet_lite0.tflite web/models/efficientdet_lite0.tflite && echo "ok (copied)        web/models/efficientdet_lite0.tflite"
+mkdir -p web/models
+cp models/efficientdet_lite0.tflite web/models/efficientdet_lite0.tflite  # on its own line, so set -e stops the script if it fails
+if [ "$(sha web/models/efficientdet_lite0.tflite)" != 4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993 ]; then
+  echo "COPY CHECK FAILED  web/models/efficientdet_lite0.tflite" >&2; exit 1
+fi
+echo "ok (copied)        web/models/efficientdet_lite0.tflite"
 get "$NPM/vision_bundle.mjs" web/vendor/vision_bundle.mjs 40f4123dfcd75cfa58add046919cc6f52fde66f009ff582997c09ba54c6ba27c
 get "$NPM/wasm/vision_wasm_internal.js" web/vendor/wasm/vision_wasm_internal.js 4a97e2520ba506c680ecd6ba6acfb146888afa0e2746d57f205352bc6ebb82eb
 get "$NPM/wasm/vision_wasm_internal.wasm" web/vendor/wasm/vision_wasm_internal.wasm f00ec4731faa23b3e714d00e88d4d10e2df5c0a427d3a2b4ae6e3526fdd14ef7
