@@ -1,4 +1,4 @@
-// SeeDeep, version 2.9: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
+// SeeDeep, version 2.10: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
 // WebAssembly runtime and the sample clip are files from the server that serves this page; the camera and any opened file stay in the page.
 // Detector: MediaPipe Tasks Vision (Apache 2.0), EfficientDet-Lite0 (80 COCO classes). Tracking, the line, the zone and the
 // counting: this file. The line can be dragged by its two ends; a zone (a polygon with draggable corners) counts who is inside and for how long.
@@ -278,4 +278,4 @@ running = true; requestAnimationFrame(loop);
 applyConfig().then(() => { $("btn-line").setAttribute("aria-pressed", String(lineOn)); $("x-row").hidden = !lineOn; window.__seedeep.lineOn = lineOn; window.__seedeep.line = line; if (zone) { $("btn-zone").setAttribute("aria-pressed", "true"); $("btn-zone").textContent = "Remove the zone"; $("z-row").hidden = false; window.__seedeep.zone = zone; } })
   .then(load).then(() => (CONFIG && CONFIG.start === "camera" ? useCamera() : useSample()))
   .catch((e) => { LOADING = ""; const why = e && e.message ? e.message.slice(0, 120).replace(/[.\s]+$/, "") : e && e.target && e.target.src ? new URL(e.target.src).pathname + " did not load" : String(e);
-    NOTE = "The detector could not load: " + why + ". A browser with WebAssembly is needed; if you serve this page yourself, run fetch_assets.sh first." + (NOTE ? " " + NOTE : ""); say(""); }); // kept, so "Sample clip" does not clear it
+    NOTE = "The detector could not load: " + why + ". A browser with WebAssembly and WebGL is needed; if you serve this page yourself, run fetch_assets.sh first." + (NOTE ? " " + NOTE : ""); say(""); }); // kept, so "Sample clip" does not clear it

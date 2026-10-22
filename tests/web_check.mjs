@@ -12,15 +12,17 @@
 // nor any zone on (the classes are not exposed to the check), ignore the stored geometry, keep the settings message, and
 // say, log and then clear the frame error; then, with the video paused, a redraw that fails must be tried once, not on
 // every animation frame. A third page is opened with the MediaPipe runtime missing (vision_bundle.mjs answered 404): its
-// "could not load" message must stay after "Sample clip" is pressed. It takes one to a few minutes, depending on the
-// machine. MediaPipe's own console lines that start "INFO: " (printed through console.error when it makes the CPU
+// "could not load" message must stay after "Sample clip" is pressed. It takes one to a few minutes on a machine whose
+// Chrome has a hardware GPU; with software WebGL only the page can be too slow, and checks time out and fail. MediaPipe's own console lines that start "INFO: " (printed through console.error when it makes the CPU
 // detector) are not counted as errors.
 // Needs: the page served (python3 web/serve.py), Node 18+, `npm install playwright-core`, and Google Chrome (Playwright's
 // own Chromium does not play the H.264 sample clip).
 // usage: CHROME="/path/to/Google Chrome" node tests/web_check.mjs [http://127.0.0.1:8000/]
-// env: CHROME (the browser to run), PLAYWRIGHT_MODULE (the path to playwright-core's index.mjs, if playwright-core is not
+// env: CHROME (the browser to run), PLAYWRIGHT_MODULE (the path to playwright-core's index.mjs, absolute or from the current folder, if playwright-core is not
 //      installed beside this repo), ALLOW_CONSOLE (a regular expression for console errors and failed requests to ignore)
 import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 const url = process.argv[2] || "http://127.0.0.1:8000/";
 const allow = process.env.ALLOW_CONSOLE ? new RegExp(process.env.ALLOW_CONSOLE) : null;
 let fails = 0;
@@ -33,7 +35,7 @@ check(same, `the page at ${url} is this repository's (its /js/seedeep.js is web/
 if (!same) end();
 let browser;
 try {
-  const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || "playwright-core");
+  const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ? pathToFileURL(path.resolve(process.env.PLAYWRIGHT_MODULE)).href : "playwright-core");
   browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: true, args: ["--autoplay-policy=no-user-gesture-required"] });
 } catch (e) { check(false, "the browser started (" + String(e).slice(0, 200) + ")"); end(); }
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
@@ -51,7 +53,9 @@ try {
   await page.waitForTimeout(5000);
   const q1 = await page.evaluate(() => ({ d: window.__seedeep.frames, f: document.getElementById("video").getVideoPlaybackQuality().totalVideoFrames }));
   check(q1.d - q0.d > 0 && q1.d - q0.d <= q1.f - q0.f + 2, `detections running, no more than the frames decoded plus 2 (${q1.d - q0.d} detections, ${q1.f - q0.f} frames decoded in 5 s)`);
-  await page.click("#btn-zone"); await page.click("#btn-line");
+  // the zone and the line on: a page whose settings file turned one on already keeps it (a click would turn it off)
+  if (!(await page.evaluate(() => window.__seedeep.zone))) await page.click("#btn-zone");
+  if (!(await page.evaluate(() => window.__seedeep.lineOn))) await page.click("#btn-line");
   let last = await page.evaluate(() => document.getElementById("video").currentTime), wrapped = false, after = 0, minStay = Infinity, maxStay = -Infinity, reads = 0, notNumber = 0;
   const banners = new Set();
   for (let k = 0; k < 140 && after < 8; k++) {
