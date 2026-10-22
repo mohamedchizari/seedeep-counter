@@ -1,4 +1,4 @@
-// SeeDeep, version 2.10: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
+// SeeDeep, version 2.12: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
 // WebAssembly runtime and the sample clip are files from the server that serves this page; the camera and any opened file stay in the page.
 // Detector: MediaPipe Tasks Vision (Apache 2.0), EfficientDet-Lite0 (80 COCO classes). Tracking, the line, the zone and the
 // counting: this file. The line can be dragged by its two ends; a zone (a polygon with draggable corners) counts who is inside and for how long.
@@ -53,7 +53,7 @@ class Tracker {
     }
     this.tracks.forEach((t, ti) => { if (!matchedT.has(ti)) t.misses += 1; });
     dets.forEach((d, di) => { if (!used.has(di)) this.tracks.push({ id: this.nextId++, cls: d.cls, box: d.box, score: d.score, hits: 1, misses: 0, counted: false, inZone: false, zoneSince: 0, lastSeen: t_s }); });
-    this.tracks = this.tracks.filter((t) => { if (t.misses > 12) { if (t.inZone) this.zoneStays.push(t.lastSeen - t.zoneSince); return false; } return true; });
+    this.tracks = this.tracks.filter((t) => { if (t.misses > 12) { if (t.inZone) { this.zoneStays.push(t.lastSeen - t.zoneSince); this.events.push([t.lastSeen, group(t.cls), t.cls, "left", t.id, pass]); } return false; } return true; });
     for (const t of this.tracks) if (!t.counted && t.hits >= 3) { t.counted = true; this.seen[t.cls] = (this.seen[t.cls] || 0) + 1; }
     return this.tracks.filter((t) => t.misses === 0 && t.hits >= 2);
   }
@@ -75,8 +75,20 @@ const perSecond = new Map(); // "pass:second" -> {pass, sec, person, vehicle, ot
 let t0 = performance.now();
 window.__seedeep = { ready: false, frames: 0, fps: 0, infMs: 0, delegate: null, lastDetections: 0, line, zone: null, lineOn: false, zoneNow: 0 };
 
+// MediaPipe reads each video frame through WebGL, on the CPU delegate too. At load: no canvas of either kind with WebGL 2 or 1
+// gives the could-not-load message. A browser whose OffscreenCanvas alone has none loads; its failed frames then say so.
+const glOn = (make) => { for (const type of ["webgl2", "webgl"]) { const gl = make().getContext(type); if (gl) { const x = gl.getExtension("WEBGL_lose_context"); if (x) x.loseContext(); return true; } } return false; };
+let offscreenNoGL = null;
+function offscreenLacksWebGL() { if (offscreenNoGL === null) { try { offscreenNoGL = typeof OffscreenCanvas !== "undefined" && !glOn(() => new OffscreenCanvas(1, 1)); } catch (e) { offscreenNoGL = false; } } return offscreenNoGL; }
+function hasWebGL() {
+  try {
+    const kinds = [() => document.createElement("canvas")]; if (typeof OffscreenCanvas !== "undefined") kinds.push(() => new OffscreenCanvas(1, 1));
+    return kinds.some(glOn);
+  } catch (e) { return true; } // a check that fails says nothing; let the detector try
+}
 async function load() {
   LOADING = "Loading the detector (about 17 MB, once)."; say("");
+  if (!hasWebGL()) throw new Error("this browser gives the page no WebGL (it is off, or there is none)");
   const { FilesetResolver, ObjectDetector } = await import("/vendor/vision_bundle.mjs");
   const vision = await FilesetResolver.forVisionTasks("/vendor/wasm");
   const opts = (delegate) => ({ baseOptions: { modelAssetPath: "/models/efficientdet_lite0.tflite", delegate }, scoreThreshold: 0.4, maxResults: 25, runningMode: "VIDEO" });
@@ -160,7 +172,7 @@ let frameErr = false;
 function frameOk() { if (frameErr) { frameErr = false; if (status.textContent.startsWith(FRAME_ERR)) say(""); } }
 function loop() {
   if (!running) return;
-  try { step(); } catch (e) { if (!frameErr) console.error("SeeDeep: " + FRAME_ERR, e); frameErr = true; say(FRAME_ERR + " (" + (e && e.message ? e.message.slice(0, 120) : e) + "); the page tries again " + (video.paused && !dragging ? "after the next change." : "on the next frame.")); }
+  try { step(); } catch (e) { if (!frameErr) console.error("SeeDeep: " + FRAME_ERR, e); frameErr = true; say(FRAME_ERR + " (" + (e && e.message ? e.message.slice(0, 120) : e) + ")" + (offscreenLacksWebGL() ? "; this page needs WebGL, and this browser gives it none on an OffscreenCanvas" : "") + "; the page tries again " + (video.paused && !dragging ? "after the next change." : "on the next frame.")); }
   requestAnimationFrame(loop);
 }
 

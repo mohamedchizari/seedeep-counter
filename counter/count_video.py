@@ -8,19 +8,29 @@ seen_by_class.csv, crossings.csv, summary.json, summary.pdf, which it moves into
 then annotated.mp4 (made from the raw file) and README.txt, moved last. .seedeep-counter-output in OUT_DIR lists what it put there.
 The model is fetched by ../fetch_assets.sh; ffmpeg (optional) re-encodes the annotated video to H.264."""
 import argparse, contextlib, csv, hashlib, json, os, signal, sys, time, subprocess, datetime, shutil
+
+def ctrl_c():
+    """Ctrl-C: one line instead of a traceback, then the end a parent expects from Ctrl-C (killed by SIGINT; exit 130 on Windows)."""
+    print('stopped (Ctrl-C)', flush=True)
+    if os.name == 'posix': signal.signal(signal.SIGINT, signal.SIG_DFL); os.kill(os.getpid(), signal.SIGINT)
+    sys.exit(130)
+
 try:
     import fcntl  # locks the output folder while a run writes into it; Windows has no fcntl, and there a second run is not stopped
 except ImportError:
     fcntl = None
-import cv2, numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python as mptasks
-from mediapipe.tasks.python import vision
 try:
-    import reportlab  # used for summary.pdf; checked here so a missing one stops the run before it starts
-except ImportError:
-    reportlab = None
-from tracker import Tracker, group, VEHICLES
+    import cv2, numpy as np
+    import mediapipe as mp
+    from mediapipe.tasks import python as mptasks
+    from mediapipe.tasks.python import vision
+    try:
+        import reportlab  # used for summary.pdf; checked here so a missing one stops the run before it starts
+    except ImportError:
+        reportlab = None
+    from tracker import Tracker, group, VEHICLES
+except KeyboardInterrupt:
+    ctrl_c()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, '..', 'models', 'efficientdet_lite0.tflite')
@@ -29,7 +39,8 @@ FFMPEG_MIN_TIMEOUT_S = 300  # an ffmpeg still running after this, or after ten t
 PDF_CLASSES = 16  # classes listed by name in summary.pdf; seen_by_class.csv has them all
 MARK = '.seedeep-counter-output'  # written in every output folder: it lists the files this program put there, with their sizes and times
 WORK = '.seedeep-counter-work'  # this run's files, until they are moved into place
-WORK_TAG = 'made-by-count_video.txt'  # written in every work folder; a run deletes a work folder only when this file is in it
+WORK_TAG = 'made-by-count_video.txt'  # written in every work folder; a run deletes a work folder only when this file is in it or the folder is empty
+TAG_TEXT = 'Made by count_video.py for one run. The next run into the folder above deletes this folder.\n'
 LITE0_SHA256 = '4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993'  # efficientdet_lite0.tflite, as fetch_assets.sh checks it
 
 def listed(out):
@@ -50,21 +61,51 @@ def inside(path, folder):
         if os.path.dirname(p) == p: return False
         p = os.path.dirname(p)
 
-def clear_work(work):
+def has_entries(folder):
+    """True if the folder holds anything, or cannot be listed."""
+    try: return bool(os.listdir(folder))
+    except OSError: return True
+
+def write_tag(work):
+    """Writes the work folder's tag file, never through a link: a link in its place is deleted first, and the file is opened
+    without following one (where the system can)."""
+    tag = os.path.join(work, WORK_TAG)
+    if os.path.islink(tag): os.remove(tag)
+    fd = os.open(tag, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o644)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f: f.write(TAG_TEXT)
+
+def clear_work(work, tries=3):
     """Deletes a work folder this program made: everything else first, its tag last, then the empty folder. A stop part way
-    leaves the folder tagged or empty, and a later run deletes either."""
-    for e in os.scandir(work):
-        if e.name == WORK_TAG: continue
-        if e.is_dir(follow_symlinks=False): shutil.rmtree(e.path)
-        else: os.remove(e.path)
-    if os.path.lexists(os.path.join(work, WORK_TAG)): os.remove(os.path.join(work, WORK_TAG))
-    os.rmdir(work)
+    leaves the folder tagged or empty, and a later run deletes either. If that fails (a file that appears meanwhile, such as
+    a .DS_Store, or one that cannot be deleted), the tag is written back and it is tried again; False if the folder stays."""
+    tag = os.path.join(work, WORK_TAG)
+    for _ in range(tries):
+        try:
+            for e in os.scandir(work):
+                if e.name == WORK_TAG: continue
+                if e.is_dir(follow_symlinks=False): shutil.rmtree(e.path)
+                else: os.remove(e.path)
+            if os.path.lexists(tag): os.remove(tag)
+            os.rmdir(work); return True
+        except OSError:
+            if not os.path.lexists(work): return True
+            with contextlib.suppress(OSError): write_tag(work)
+    return False
 
 STOPS = [getattr(signal, n) for n in ('SIGINT', 'SIGTERM', 'SIGHUP') if hasattr(signal, n)]  # Windows has no SIGHUP
 
+GOT = []  # the stops this run has had: a library can swallow the exception a signal raised, so the run also checks this
+
 def stop_here(n, f):
-    """SIGTERM and SIGHUP end the run as Ctrl-C does: by an exception, so subprocess.run stops an ffmpeg it started."""
-    raise SystemExit(128 + n)
+    """SIGTERM and SIGHUP end the run as Ctrl-C does: by an exception, so the ffmpeg it started is stopped (see the video step)."""
+    GOT.append(n); raise SystemExit(128 + n)
+
+def on_ctrl_c(n, f):
+    GOT.append(n); raise KeyboardInterrupt
+
+def check_stop():
+    """Ends the run if a stop came whose exception did not (see GOT)."""
+    if GOT: raise KeyboardInterrupt if GOT[0] == signal.SIGINT else SystemExit(128 + GOT[0])
 
 @contextlib.contextmanager
 def no_stop():
@@ -95,8 +136,10 @@ def main():
     ap.add_argument('--no-video', action='store_true'); a = ap.parse_args()
     for sig in STOPS[1:]:
         if signal.getsignal(sig) == signal.SIG_DFL: signal.signal(sig, stop_here)  # one the caller ignores stays ignored: nohup ignores SIGHUP
-    try: a.inp.encode('utf-8')
-    except UnicodeEncodeError: ap.error('the input file name is not valid UTF-8 (OpenCV would crash on it) - rename the file')
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler: signal.signal(signal.SIGINT, on_ctrl_c)  # an ignored Ctrl-C stays ignored
+    for v, what in ((a.inp, 'the input file name'), (a.out, 'the OUT_DIR name'), (a.model, 'the --model path'), (a.ffmpeg, 'the --ffmpeg name'), (a.title, '--title'), (a.line_text, '--line-text')):
+        try: v.encode('utf-8')
+        except UnicodeEncodeError: ap.error(what + ' is not valid UTF-8 (OpenCV or the outputs would fail on it) - change it')
     if a.every < 1: ap.error('--every must be 1 or more')
     if not 0 <= a.line < 1: ap.error('--line must be 0 (no line) or a fraction of the height below 1')
     if not a.max_minutes > 0: ap.error('--max-minutes must be a number above 0')  # written so that nan is refused too
@@ -109,12 +152,15 @@ def main():
     opts = vision.ObjectDetectorOptions(base_options=mptasks.BaseOptions(model_asset_path=a.model), running_mode=vision.RunningMode.VIDEO, score_threshold=0.4, max_results=25)
     try: det = vision.ObjectDetector.create_from_options(opts)  # before the output folder is made, so a bad model leaves no empty folder
     except Exception as e: print('the detector could not be made from', a.model, '-', str(e)[:200]); sys.exit(2)
-    lite0 = hashlib.sha256(open(a.model, 'rb').read()).hexdigest() == LITE0_SHA256  # only this model is named EfficientDet-Lite0 in the outputs
+    check_stop(); lite0 = hashlib.sha256(open(a.model, 'rb').read()).hexdigest() == LITE0_SHA256  # only this model is named EfficientDet-Lite0 in the outputs
     model = os.path.basename(a.model) + (' (EfficientDet-Lite0, float16)' if lite0 else '')
+    out_abs = up = os.path.abspath(a.out); made_top = None  # the folders this run makes (OUT_DIR and any missing above it) are
+    while not os.path.lexists(up) and os.path.dirname(up) != up: made_top, up = up, os.path.dirname(up)  # deleted again if it reads no frame
     try: os.makedirs(a.out, exist_ok=True)
     except OSError as e: ap.error('OUT_DIR cannot be made: ' + str(e))
     if fcntl:  # taken before the folder is looked at and held until this run ends (the system lets go of it even if the run is killed), so a second run into OUT_DIR meanwhile is refused
-        lock = os.open(a.out, os.O_RDONLY)
+        try: lock = os.open(a.out, os.O_RDONLY)
+        except OSError as e: print(a.out, 'cannot be opened:', e.strerror or e, '- check its permissions, or choose another output folder'); sys.exit(2)
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: print('another run is writing into', a.out, '- wait for it to end, or choose another output folder'); sys.exit(2)
         except OSError: print('this disk cannot lock', a.out, '- the run goes on, but a second run into it at the same time is not stopped', flush=True)
@@ -134,12 +180,15 @@ def main():
     ff = shutil.which(a.ffmpeg) if a.ffmpeg else None
     for path, what in ((a.inp, 'the input'), (a.model, 'the model'), (ff, 'the ffmpeg')):
         if path and inside(path, work): print(what, 'is inside', work, 'which a run into', a.out, 'deletes - move it out first'); sys.exit(2)
-    if os.path.lexists(work) and (os.path.islink(work) or not os.path.isdir(work) or not (os.path.isfile(os.path.join(work, WORK_TAG)) or not os.listdir(work))):
-        print(a.out, 'holds', WORK, 'that is a link, not a folder, or a folder with files but without', WORK_TAG, '(left by an earlier version, or not made by this program) - check it and delete it, or choose another output folder'); sys.exit(2)
+    tag = os.path.join(work, WORK_TAG); tagged = os.path.isfile(tag) and not os.path.islink(tag)
+    if os.path.lexists(work) and (os.path.islink(work) or not os.path.isdir(work) or not (tagged or not has_entries(work))):
+        print(a.out, 'holds', WORK, 'that is a link, not a folder, a folder that cannot be read, or a folder with files but without', WORK_TAG, 'as a plain file (left by an earlier version, or not made by this program) - check it and delete it, or choose another output folder'); sys.exit(2)
     tr = Tracker()
-    if os.path.isdir(work): clear_work(work)  # what a stopped run left: tagged or empty (checked above)
-    os.makedirs(work)
-    with open(os.path.join(work, WORK_TAG), 'w', encoding='utf-8') as f: f.write('Made by count_video.py for one run. The next run into the folder above deletes this folder.\n')
+    if os.path.isdir(work) and not clear_work(work):  # what a stopped run left: tagged or empty (checked above)
+        print(work, 'could not be deleted (it cannot be listed, or a file in it cannot be deleted or keeps coming back) - check it, or choose another output folder'); sys.exit(2)
+    try:
+        os.makedirs(work); write_tag(work)
+    except OSError as e: print(a.out, 'cannot be written:', e.strerror or e, '- choose another output folder'); sys.exit(2)
     raw, final = os.path.join(work, '_annotated_raw.mp4'), os.path.join(work, 'annotated.mp4')
     fps = cap.get(cv2.CAP_PROP_FPS) or 25; W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     limit = a.max_minutes * 60  # stop at the end of the file or here; the frame count in a file's header can be wrong or negative
@@ -150,7 +199,7 @@ def main():
         if not writer.isOpened(): print('the annotated video cannot be written here; going on without it', flush=True); writer = None
     per_sec = {}; per_min = {}; frames = 0; i = 0; t0 = time.time(); inf_ms = []; last_ms = -1
     while True:
-        ok, frame = cap.read()
+        check_stop(); ok, frame = cap.read()
         if not ok: break
         t_s = i / fps
         if t_s > limit: break
@@ -173,7 +222,13 @@ def main():
     cap.release(); dur = i / fps
     if frames == 0:
         if writer is not None: writer.release()
-        clear_work(work)
+        if clear_work(work) and made_top:
+            d = out_abs  # the folders this run made, from OUT_DIR up, each only if nothing else is in it
+            while True:
+                try: os.rmdir(d)
+                except OSError: break
+                if d == made_top: break
+                d = os.path.dirname(d)
         print('no frames could be read from', a.inp, "- an earlier run's outputs are left as they were"); sys.exit(3)
     if writer is not None: writer.release()
     # tables
@@ -222,14 +277,18 @@ def main():
             os.replace(os.path.join(work, MARK), os.path.join(a.out, MARK))
     # the tables, the summary and the PDF go into place before the video step, so a video step that fails or is stopped cannot
     # cost them; an earlier run's video and README.txt are deleted at the same time, so they cannot sit beside this run's tables
-    put(['counts_per_second.csv', 'counts_per_minute.csv', 'seen_by_class.csv', 'crossings.csv', 'summary.json', 'summary.pdf'], ['annotated.mp4', 'README.txt', '_annotated_raw.mp4'])
+    check_stop(); put(['counts_per_second.csv', 'counts_per_minute.csv', 'seen_by_class.csv', 'crossings.csv', 'summary.json', 'summary.pdf'], ['annotated.mp4', 'README.txt', '_annotated_raw.mp4'])
     # the annotated video: re-encoded to H.264 when an ffmpeg is found and works, else kept as written (MPEG-4 Part 2)
+    check_stop()
     if writer is not None and os.path.exists(raw):
         encoded = False
         if ff:
             try:
-                r = subprocess.run([ff, '-nostdin', '-y', '-loglevel', 'error', '-i', raw, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', final], check=False, timeout=max(FFMPEG_MIN_TIMEOUT_S, 10 * dur))
-                encoded = r.returncode == 0 and os.path.exists(final)
+                p = subprocess.Popen([ff, '-nostdin', '-y', '-loglevel', 'error', '-i', raw, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', final])  # in the run's process group, so a stop sent to the group reaches it too
+                try: encoded = p.wait(timeout=max(FFMPEG_MIN_TIMEOUT_S, 10 * dur)) == 0 and os.path.exists(final)
+                except BaseException:  # the time limit, Ctrl-C, SIGTERM or SIGHUP: the ffmpeg ends too (not what a wrapper script started)
+                    with contextlib.suppress(OSError): p.kill()
+                    p.wait(); raise
             except OSError as e:
                 print('ffmpeg could not be run:', e, flush=True)
             except subprocess.TimeoutExpired:
@@ -240,12 +299,12 @@ def main():
         else:
             if os.path.exists(final): os.remove(final)
             os.rename(raw, final)
-    with open(os.path.join(work, 'README.txt'), 'w', encoding='utf-8') as f: f.write('SeeDeep video counts\n\ncounts_per_second.csv: the most people, vehicles and other things in frame in each second.\ncounts_per_minute.csv: per minute, the most and the average in frame, and the line crossings.\nseen_by_class.csv: how many tracked things of each class were seen (a thing the detector loses for more than 12 of the frames looked at and finds again is counted again each time; two things close together can be seen as one, and two that pass each other can swap tracks).\ncrossings.csv: every crossing of the line with its time, direction and track.\n' + ('annotated.mp4: the video with the boxes and the line drawn.\n' if os.path.exists(final) else '') + ('summary.json: the totals and the peaks; summary.pdf: the same, with the method and its limits.\n\n' if has_pdf else 'summary.json: the totals and the peaks.\n\n') + 'Detector: MediaPipe, model ' + model + ('; Apache 2.0, 80 COCO classes' if lite0 else '') + '; it does not read faces, plates or text. Counts can be wrong' + ('; the annotated video is there so you can judge' if os.path.exists(final) else '') + '.\n')
+    with open(os.path.join(work, 'README.txt'), 'w', encoding='utf-8') as f: f.write('SeeDeep video counts\n\ncounts_per_second.csv: the most people, vehicles and other things in frame in each second.\ncounts_per_minute.csv: per minute, the most and the average in frame, and the line crossings.\nseen_by_class.csv: how many tracks of each class reached 3 hits ("seen"; a thing the detector loses for more than 12 of the frames looked at and finds again is counted again each time; two things close together can be seen as one, and two that pass each other can swap tracks).\ncrossings.csv: every crossing of the line with its time, direction and track.\n' + ('annotated.mp4: the video with the boxes and the line drawn.\n' if os.path.exists(final) else '') + ('summary.json: the totals and the peaks; summary.pdf: the same, with the method and its limits.\n\n' if has_pdf else 'summary.json: the totals and the peaks.\n\n') + 'Detector: MediaPipe, model ' + model + ('; Apache 2.0, 80 COCO classes' if lite0 else '') + '; it does not read faces, plates or text. Counts can be wrong' + ('; the annotated video is there so you can judge' if os.path.exists(final) else '') + '.\n')
     put(['annotated.mp4', 'README.txt'])  # last, after the video step
-    if kept: print('left as they were, as they changed in', a.out, 'during this run:', ', '.join(dict.fromkeys(kept)), "- this run's files of those names were not kept", flush=True)
-    clear_work(work)
+    if kept: print('left as they were, as they changed in', a.out, "during this run (before or after this run's file of that name was moved in):", ', '.join(dict.fromkeys(kept)), '- they are not listed in', MARK, flush=True)
+    if not clear_work(work): print(work, 'could not be deleted (it cannot be listed, or a file in it cannot be deleted or keeps coming back); the next run into', a.out, 'tries again', flush=True)
     print(json.dumps({k: summary[k] for k in ('frames_processed', 'duration_s', 'ms_per_detection_mean', 'people_seen', 'vehicles_seen', 'crossings', 'peak_people_in_frame')}))
-    if kept: sys.exit(4)  # some of this run's files were not kept (above)
+    if kept: sys.exit(4)  # some files in OUT_DIR changed during this run (above)
 
 def pdf(s, per_min, ev, path, video=False, lite0=True):
     from reportlab.lib.pagesizes import letter
@@ -274,11 +333,11 @@ def pdf(s, per_min, ev, path, video=False, lite0=True):
     line('SeeDeep video counts', 20, 28, True)
     line(f"{s['input']}" + (f" for {s['title']}" if s['title'] else '') + f", made {s['made'][:16].replace('T', ' ')} UTC", 11, 22)
     line('What was counted', 14, 20, True)
-    line(f"Length {s['duration_s'] / 60:.1f} minutes, {s['width']} by {s['height']} at {s['fps']} frames a second; {s['frames_processed']} frames looked at" + (f" (one in every {s['every_nth_frame']})" if s['every_nth_frame'] > 1 else '') + '.')
-    line(f"People seen: {s['people_seen']}. Vehicles seen: {s['vehicles_seen']}. Peak people in frame: {s['peak_people_in_frame']['count']} at {s['peak_people_in_frame']['second'] // 60}:{s['peak_people_in_frame']['second'] % 60:02d}. Peak vehicles in frame: {s['peak_vehicles_in_frame']['count']} at {s['peak_vehicles_in_frame']['second'] // 60}:{s['peak_vehicles_in_frame']['second'] % 60:02d}.")
+    line("Length " + (f"{s['duration_s']:.1f} seconds" if s['duration_s'] < 60 else f"{s['duration_s'] / 60:.1f} minutes") + f", {s['width']} by {s['height']} at {s['fps']} frames a second; {s['frames_processed']} frames looked at" + (f" (one in every {s['every_nth_frame']})" if s['every_nth_frame'] > 1 else '') + '.')
+    line(f"Person tracks seen: {s['people_seen']}. Vehicle tracks seen: {s['vehicles_seen']}. Peak people in frame: {s['peak_people_in_frame']['count']} at {s['peak_people_in_frame']['second'] // 60}:{s['peak_people_in_frame']['second'] % 60:02d}. Peak vehicles in frame: {s['peak_vehicles_in_frame']['count']} at {s['peak_vehicles_in_frame']['second'] // 60}:{s['peak_vehicles_in_frame']['second'] % 60:02d}.")
     if s['line']:
         line(f"Line at {round(s['line']['fraction_of_height'] * 100)}% of the height" + (f" ({s['line']['text']})" if s['line']['text'] else '') + f": people crossed down {s['crossings']['person']['down']}, up {s['crossings']['person']['up']}; vehicles down {s['crossings']['vehicle']['down']}, up {s['crossings']['vehicle']['up']}.")
-    y -= 6; line('Seen, by class', 14, 20, True)
+    y -= 6; line('Tracks seen, by class', 14, 20, True)
     for cls, n in sorted(s['seen'].items(), key=lambda x: -x[1])[:PDF_CLASSES]: line(f"{cls}: {n}", 11, 14)
     if len(s['seen']) > PDF_CLASSES: line(f"and {len(s['seen']) - PDF_CLASSES} more classes, in seen_by_class.csv", 11, 14)
     y -= 6; line('By minute (most in frame; crossings)', 14, 20, True)
@@ -298,7 +357,7 @@ def pdf(s, per_min, ev, path, video=False, lite0=True):
         for m in mins: h = 100 * per_min[m]['person_max'] / (mx or 1); c.rect(inch + (m - m0) * bw, base, max(bw * 0.8, bw - 2), h, fill=1, stroke=0)
         c.setFillColorRGB(0, 0, 0); c.setFont('Helvetica', 8); c.drawString(inch, base - 12, f"minute {m0} to {m1}, one slot a minute; tallest bar = {mx}"); y = base - 30
     y -= 6; line('Method and limits', 14, 20, True)
-    for t in [f"Detector: {s['detector']} (" + ('MediaPipe, Google, Apache 2.0; 80 everyday classes; ' if lite0 else '') + "it does not read faces, plates or text).", f"Tracking: {s['tracker']}. A thing the detector loses for more than 12 of the frames looked at and finds again is counted again each time; two things close together can be seen as one, and two that pass each other can swap tracks.", f"Speed on the machine that made this: {s['ms_per_detection_mean']} ms a detection.", 'Accuracy was not measured on this footage. Counts can be wrong.' + (' The annotated video is included so you can judge them yourself.' if video else ''), 'Made by count_video.py on the machine that ran it; the script itself makes no network request.']:
+    for t in [f"Detector: {s['detector']} (" + ('MediaPipe, Google, Apache 2.0; 80 everyday classes; ' if lite0 else '') + "it does not read faces, plates or text).", f"Tracking: {s['tracker']}. A thing the detector loses for more than 12 of the frames looked at and finds again is counted again each time; two things close together can be seen as one, and two that pass each other can swap tracks.", f"Speed on the machine that made this: {s['ms_per_detection_mean']} ms a detection.", 'Accuracy was not measured on this footage. Counts can be wrong.' + (' The annotated video is included so you can judge them yourself.' if video else ''), 'Made by count_video.py on the machine that ran it.']:
         words = t.split(); buf = ''
         for w in words:
             if c.stringWidth(buf + ' ' + w, 'Helvetica', 10) > Wp - 2 * inch: line(buf, 10, 13); buf = w
@@ -306,4 +365,6 @@ def pdf(s, per_min, ev, path, video=False, lite0=True):
         line(buf, 10, 15)
     c.save()
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    try: main()
+    except KeyboardInterrupt: ctrl_c()

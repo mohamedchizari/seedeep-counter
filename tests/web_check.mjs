@@ -12,14 +12,17 @@
 // nor any zone on (the classes are not exposed to the check), ignore the stored geometry, keep the settings message, and
 // say, log and then clear the frame error; then, with the video paused, a redraw that fails must be tried once, not on
 // every animation frame. A third page is opened with the MediaPipe runtime missing (vision_bundle.mjs answered 404): its
-// "could not load" message must stay after "Sample clip" is pressed. It takes one to a few minutes on a machine whose
-// Chrome has a hardware GPU; with software WebGL only the page can be too slow, and checks time out and fail. MediaPipe's own console lines that start "INFO: " (printed through console.error when it makes the CPU
-// detector) are not counted as errors.
+// "could not load" message must stay after "Sample clip" is pressed. It takes one to a few minutes on a machine
+// whose Chrome has a hardware GPU; with software WebGL only the page can be too slow, and checks time out and fail.
+// MediaPipe's own console lines that start "INFO: " (printed through console.error when it makes the CPU detector) are not
+// counted as errors.
 // Needs: the page served (python3 web/serve.py), Node 18+, `npm install playwright-core`, and Google Chrome (Playwright's
 // own Chromium does not play the H.264 sample clip).
 // usage: CHROME="/path/to/Google Chrome" node tests/web_check.mjs [http://127.0.0.1:8000/]
-// env: CHROME (the browser to run), PLAYWRIGHT_MODULE (the path to playwright-core's index.mjs, absolute or from the current folder, if playwright-core is not
-//      installed beside this repo), ALLOW_CONSOLE (a regular expression for console errors and failed requests to ignore)
+// env: CHROME (the browser to run), PLAYWRIGHT_MODULE (if playwright-core cannot be found from tests/, which `npm install
+//      playwright-core` in the repository root makes it: the path to its index.mjs, absolute or from the current folder; or
+//      the name of another package that provides chromium, such as playwright, found from tests/ as playwright-core would
+//      be), ALLOW_CONSOLE (a regular expression for console errors and failed requests to ignore)
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -35,7 +38,8 @@ check(same, `the page at ${url} is this repository's (its /js/seedeep.js is web/
 if (!same) end();
 let browser;
 try {
-  const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ? pathToFileURL(path.resolve(process.env.PLAYWRIGHT_MODULE)).href : "playwright-core");
+  const pm = process.env.PLAYWRIGHT_MODULE, file = pm && fs.existsSync(path.resolve(pm)) && fs.statSync(path.resolve(pm)).isFile(); // a file, else a package name
+  const { chromium } = await import(!pm ? "playwright-core" : file ? pathToFileURL(path.resolve(pm)).href : pm);
   browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: true, args: ["--autoplay-policy=no-user-gesture-required"] });
 } catch (e) { check(false, "the browser started (" + String(e).slice(0, 200) + ")"); end(); }
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });

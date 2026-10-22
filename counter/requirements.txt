@@ -1,8 +1,12 @@
 # The versions the counter was last run with, on Python 3.9. numpy 2.0.2 installs from wheels on Python 3.9 to 3.12 only;
-# on a newer Python, pip would build it from source. Other versions were not tried. mediapipe 1.1.1 has wheels for macOS on
-# Apple silicon, Linux (x86_64, aarch64) and Windows, and none for an Intel Mac (macOS x86_64), so it does not install there.
-# OpenCV is the contrib build because mediapipe itself installs that one; two OpenCV packages would share cv2/.
-mediapipe==1.1.1
+# on a newer Python, pip would build it from source. Other versions were not tried, apart from those the README names.
+# mediapipe is held at 0.10.32: in a test on Linux x86_64, mediapipe 1.1.1 connected to play.googleapis.com (Google's
+# logging endpoint) on every run that made the detector, and 0.10.32 made no connection (see the README's Privacy section).
+# mediapipe 0.10.32 has wheels for macOS on Apple silicon, Linux x86_64 (glibc 2.28 or later) and Windows x86_64 only, so it
+# does not install on an Intel Mac, on Linux on ARM or on Windows on ARM; OpenCV 5.0.0.93's wheel for Apple silicon needs
+# macOS 13 or later. OpenCV is the contrib build because mediapipe itself installs that one; two OpenCV packages would share
+# cv2/.
+mediapipe==0.10.32
 opencv-contrib-python==5.0.0.93
 numpy==2.0.2
 reportlab==5.0.1
