@@ -122,6 +122,17 @@ class Tracking(unittest.TestCase):
         self.walk(tr, 'person', [100, 101, 102])
         self.assertEqual(tr.seen, {'person': 2})
 
+    def test_a_new_track_is_kept_through_twelve_misses(self):
+        tr = Tracker(); tr.update([det('person', 100, 100)], 0, 0)
+        for i in range(12): tr.update([], 0, (i + 1) / 25)
+        self.assertEqual(len(tr.tracks), 1, 'a track seen once is kept through 12 misses too')
+        tr.update([], 0, 13 / 25); self.assertEqual(tr.tracks, [], 'and dropped on the 13th')
+
+    def test_score_follows_the_latest_match(self):
+        tr = Tracker(); tr.update([det('person', 100, 100, score=0.5)], 0, 0)
+        out = tr.update([det('person', 101, 100, score=0.8)], 0, 0.04)
+        self.assertEqual(out[0]['score'], 0.8)
+
     def test_greedy_match_takes_highest_iou(self):
         tr = Tracker(); tr.update([det('person', 100, 100)], 0, 0)
         tr.update([det('person', 115, 100), det('person', 104, 100)], 0, 0.04)

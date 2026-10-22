@@ -22,13 +22,17 @@ MUTATIONS = [
     ("t['hits'] >= 2]", "t['hits'] >= 1]"),                                # what is drawn
     ("if d['cls'] == t['cls']:", "if True:"),                              # same class only
     ("g in ('person', 'vehicle')", "g in ('person', 'vehicle', 'other')"),  # who crosses
+    ("t['score'] = d['score']; ", ""),                                      # the score follows the match
+    ("'hits': 1, 'misses': 0, 'counted': False}", "'hits': 1, 'misses': 1, 'counted': False}"),  # a new track starts with no misses
 ]
+first = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'], cwd=ROOT, capture_output=True, text=True)
+if first.returncode != 0: print('the tests fail on the unchanged tracker; fix that first'); sys.exit(2)
 caught = 0
 for old, new in MUTATIONS:
     assert SRC.count(old) == 1, old
     d = tempfile.mkdtemp(prefix='mutate_')
     try:
-        shutil.copytree(ROOT, os.path.join(d, 'r'), ignore=shutil.ignore_patterns('.git', '.venv', 'venv', '__pycache__', 'models', 'vendor', 'out', '*.mp4'))
+        shutil.copytree(ROOT, os.path.join(d, 'r'), ignore=shutil.ignore_patterns('.git', '.venv', 'venv', '__pycache__', 'node_modules', 'models', 'vendor', 'out', '*.mp4'))
         open(os.path.join(d, 'r', 'counter', 'tracker.py'), 'w', encoding='utf-8').write(SRC.replace(old, new))
         r = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'], cwd=os.path.join(d, 'r'), capture_output=True, text=True)  # -B and no copied __pycache__, so the changed tracker.py is the one that runs
     finally:

@@ -1,5 +1,5 @@
-// SeeDeep, version 2.5: object detection and counting in the visitor's own browser. Nothing leaves the device: the model, the
-// WebAssembly runtime and the sample clip are files on this site; the camera and any opened file stay in the page.
+// SeeDeep, version 2.7: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
+// WebAssembly runtime and the sample clip are files from the server that serves this page; the camera and any opened file stay in the page.
 // Detector: MediaPipe Tasks Vision (Apache 2.0), EfficientDet-Lite0 (80 COCO classes). Tracking, the line, the zone and the
 // counting: this file. The line can be dragged by its two ends; a zone (a polygon with draggable corners) counts who is inside and for how long.
 
@@ -8,7 +8,8 @@ const group = (c) => (c === "person" ? "person" : VEHICLES.has(c) ? "vehicle" : 
 const COLORS = { person: "#f2a516", vehicle: "#1fa3a6", other: "#8a98a8" };
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d"), status = $("status");
-const say = (t) => { status.textContent = t; status.hidden = !t; };
+let NOTE = ""; // a settings-file problem, shown whenever nothing else is being said
+const say = (t) => { const s = t || NOTE; status.textContent = s; status.hidden = !s; };
 // a page can carry <body data-config="./config.json">: its line, its zone, the classes it counts, and whether to start on the camera
 let ALLOW = null, CONFIG = null;
 // the line and the zone live in fractions of the frame, so they survive a change of source size
@@ -29,7 +30,7 @@ function iou(a, b) {
 }
 class Tracker {
   constructor() { this.tracks = []; this.nextId = 1; this.seen = {}; this.crossings = { person: { down: 0, up: 0 }, vehicle: { down: 0, up: 0 } }; this.zoneEntered = 0; this.zoneStays = []; this.events = []; }
-  update(dets, w, h, L, poly, t_s, dt) {
+  update(dets, w, h, L, poly, t_s) {
     const used = new Set(), pairs = [];
     this.tracks.forEach((t, ti) => dets.forEach((d, di) => { if (d.cls === t.cls) { const s = iou(t.box, d.box); if (s > 0.3) pairs.push([s, ti, di]); } }));
     pairs.sort((p, q) => q[0] - p[0]);
@@ -75,14 +76,14 @@ let t0 = performance.now();
 window.__seedeep = { ready: false, frames: 0, fps: 0, infMs: 0, delegate: null, lastDetections: 0, line, zone: null, lineOn: false, zoneNow: 0 };
 
 async function load() {
-  say("Loading the detector (about 17 MB, once).");
+  say((NOTE ? NOTE + " " : "") + "Loading the detector (about 17 MB, once).");
   const { FilesetResolver, ObjectDetector } = await import("/vendor/vision_bundle.mjs");
   const vision = await FilesetResolver.forVisionTasks("/vendor/wasm");
   const opts = (delegate) => ({ baseOptions: { modelAssetPath: "/models/efficientdet_lite0.tflite", delegate }, scoreThreshold: 0.4, maxResults: 25, runningMode: "VIDEO" });
   try { detector = await ObjectDetector.createFromOptions(vision, opts("GPU")); window.__seedeep.delegate = "GPU"; }
   catch (e) { detector = await ObjectDetector.createFromOptions(vision, opts("CPU")); window.__seedeep.delegate = "CPU"; }
   window.__seedeep.ready = true;
-  if (status.textContent.startsWith("Loading the detector")) say("");
+  if (status.textContent.includes("Loading the detector")) say("");
   for (const b of ["btn-camera", "btn-file", "btn-line", "btn-zone", "btn-csv"]) $(b).disabled = false;
 }
 
@@ -100,7 +101,7 @@ function draw(tracks, w, h) {
     ctx.strokeStyle = "rgba(233,237,240,0.95)"; ctx.setLineDash([12 * s, 8 * s]); ctx.lineWidth = 2 * s; ctx.beginPath(); ctx.moveTo(line.x1 * w, line.y1 * h); ctx.lineTo(line.x2 * w, line.y2 * h); ctx.stroke(); ctx.setLineDash([]);
     handle(line.x1 * w, line.y1 * h, s, "#e9edf0"); handle(line.x2 * w, line.y2 * h, s, "#e9edf0");
   }
-  ctx.font = `${12 * s}px Montserrat, system-ui, sans-serif`; ctx.textBaseline = "top";
+  ctx.font = `${12 * s}px Montserrat, system-ui, sans-serif`; ctx.textBaseline = "top"; // Montserrat if the page provides it, else system-ui
   for (const t of tracks) {
     const g = group(t.cls), c = COLORS[g], b = t.box, k = Math.min(b.w, b.h) * 0.22;
     ctx.strokeStyle = c; ctx.lineWidth = 2 * s;
@@ -136,7 +137,7 @@ function paintCounts(tracks, t_s) {
 function step() {
   if (detector && video.readyState >= 2 && !video.paused && (RVFC ? newFrame : video.currentTime !== lastT)) {
     newFrame = false;
-    const t_s = RVFC ? frameTime : video.currentTime, dt = lastT < 0 || t_s < prevT ? 0 : t_s - prevT;
+    const t_s = RVFC ? frameTime : video.currentTime;
     if (lastT >= 0 && t_s < prevT) { tracker.restart(); pass += 1; }
     lastT = t_s; prevT = t_s;
     const a = performance.now();
@@ -146,15 +147,20 @@ function step() {
     let dets = res.detections.map((d) => ({ cls: d.categories[0].categoryName, score: d.categories[0].score, box: { x: d.boundingBox.originX, y: d.boundingBox.originY, w: d.boundingBox.width, h: d.boundingBox.height } }));
     if (ALLOW) dets = dets.filter((d) => ALLOW.has(d.cls));
     const w = video.videoWidth, h = video.videoHeight;
-    const tracks = tracker.update(dets, w, h, lineOn ? line : null, zone, t_s, dt);
-    draw(tracks, w, h); paintCounts(tracks, t_s);
+    const tracks = tracker.update(dets, w, h, lineOn ? line : null, zone, t_s);
+    paintCounts(tracks, t_s);  // the counts and the per-second row first, so a frame whose drawing fails is still in the record
     frames += 1; const dtp = (b - t0) / 1000; if (dtp >= 1) { fps = frames / dtp; frames = 0; t0 = b; }
     Object.assign(window.__seedeep, { frames: window.__seedeep.frames + 1, fps, infMs, lastDetections: dets.length });
-  } else if (detector && video.paused && (dragging || needsRedraw)) { needsRedraw = false; draw(tracker.tracks.filter((t) => t.misses === 0 && t.hits >= 2), video.videoWidth || canvas.width, video.videoHeight || canvas.height); }
+    draw(tracks, w, h);
+    frameOk();
+  } else if (detector && video.paused && (dragging || needsRedraw)) { draw(tracker.tracks.filter((t) => t.misses === 0 && t.hits >= 2), video.videoWidth || canvas.width, video.videoHeight || canvas.height); needsRedraw = false; frameOk(); }
 }
+const FRAME_ERR = "A video frame could not be looked at";
+let frameErr = false;
+function frameOk() { if (frameErr) { frameErr = false; if (status.textContent.startsWith(FRAME_ERR)) say(""); } }
 function loop() {
   if (!running) return;
-  try { step(); } catch (e) { say("The detector stopped on this video: " + (e && e.message ? e.message.slice(0, 120) : e)); }
+  try { step(); } catch (e) { if (!frameErr) console.error("SeeDeep: " + FRAME_ERR, e); frameErr = true; say(FRAME_ERR + " (" + (e && e.message ? e.message.slice(0, 120) : e) + "); the page tries again on the next frame."); }
   requestAnimationFrame(loop);
 }
 
@@ -207,7 +213,11 @@ canvas.addEventListener("pointermove", (ev) => {
 const endDrag = (ev) => { if (!dragging) return; if (dragging.kind === "zone") tracker.events.push([Math.max(0, lastT), "", "", "zone moved", "", pass]); else tracker.events.push([Math.max(0, lastT), "", "", "line moved", "", pass]); dragging = null; try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {} remember(); };
 canvas.addEventListener("pointerup", endDrag); canvas.addEventListener("pointercancel", endDrag);
 function remember() { try { localStorage.setItem(STORE_KEY, JSON.stringify({ line, zone, lineOn })); } catch (e) {} }
-function recall() { try { const s = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); if (s && s.line) { line = s.line; zone = s.zone || null; lineOn = !!s.lineOn; } } catch (e) {} }
+const num = (v) => typeof v === "number" && Number.isFinite(v);
+function cleanLine(L) { return L && typeof L === "object" && [L.x1, L.y1, L.x2, L.y2].every(num) ? { x1: clamp01(L.x1), y1: clamp01(L.y1), x2: clamp01(L.x2), y2: clamp01(L.y2) } : null; }
+function cleanZone(Z) { return Array.isArray(Z) && Z.length >= 3 && Z.every((p) => p && num(p.x) && num(p.y)) ? Z.slice(0, 8).map((p) => ({ x: clamp01(p.x), y: clamp01(p.y) })) : null; }
+// what this browser kept is used only when the line's values are numbers, and the zone (3 or more points, cut to 8) only with that line; values are clamped to the frame; anything else is ignored
+function recall() { try { const s = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); const L = s && cleanLine(s.line); if (L) { line = L; zone = cleanZone(s.zone); lineOn = s.lineOn === true; } } catch (e) {} }
 function setLineOn(on) { lineOn = on; $("btn-line").setAttribute("aria-pressed", String(on)); $("x-row").hidden = !on; window.__seedeep.lineOn = on; if (on) say("Drag the ends of the line, or the line itself."); else if (status.textContent.startsWith("Drag the ends")) say(""); remember(); needsRedraw = true; }
 function setZone(poly) { const t_now = Math.max(0, lastT); if (zone) zoneHistory.push({ corners: zone, entered: tracker.zoneEntered, meanStay: tracker.meanStay(t_now), until: t_now, pass }); zone = poly; tracker.newZone(t_now); $("btn-zone").setAttribute("aria-pressed", String(!!poly)); $("btn-zone").textContent = poly ? "Remove the zone" : "Add a zone"; $("z-row").hidden = !poly; window.__seedeep.zone = poly; if (poly) say("Drag the corners of the zone."); else if (status.textContent.startsWith("Drag the corners")) say(""); remember(); needsRedraw = true; }
 
@@ -235,7 +245,7 @@ $("btn-zone").addEventListener("click", () => setZone(zone ? null : [{ x: 0.3, y
 $("btn-csv").addEventListener("click", csv);
 $("btn-copy").addEventListener("click", async () => {
   const t = `SeeDeep measured on this device, ${new Date().toISOString()}: ${fps.toFixed(0)} frames a second, ${infMs.toFixed(0)} ms a detection, ${window.__seedeep.delegate} delegate, ${navigator.userAgent}`;
-  try { await navigator.clipboard.writeText(t); say("Copied."); setTimeout(() => say(""), 1500); } catch (e) { say(t); }
+  try { await navigator.clipboard.writeText(t); say("Copied."); setTimeout(() => { if (status.textContent === "Copied.") say(""); }, 1500); } catch (e) { say(t); }
 });
 video.addEventListener("ended", () => { if (source === "file") say("End of the file. The counts stand; download the CSV or open another file."); });
 
@@ -243,14 +253,26 @@ async function applyConfig() {
   recall();
   const src = document.body.dataset.config; if (!src) return;
   try {
-    CONFIG = await (await fetch(src, { cache: "no-store" })).json();
-    const L = CONFIG.line;
-    if (typeof L === "number" && L > 0 && L < 1) { line = { x1: 0, y1: L, x2: 1, y2: L }; lineOn = true; }
-    else if (L && typeof L === "object" && [L.x1, L.y1, L.x2, L.y2].every((v) => typeof v === "number")) { line = { x1: clamp01(L.x1), y1: clamp01(L.y1), x2: clamp01(L.x2), y2: clamp01(L.y2) }; lineOn = true; }
-    if (Array.isArray(CONFIG.zone) && CONFIG.zone.length >= 3) zone = CONFIG.zone.slice(0, 8).map((p) => ({ x: clamp01(+p.x || 0), y: clamp01(+p.y || 0) }));
-    if (Array.isArray(CONFIG.classes) && CONFIG.classes.length) ALLOW = new Set(CONFIG.classes);
-    window.__seedeep.config = CONFIG;
-  } catch (e) { say("The counter's settings could not be read: " + (e && e.message ? e.message.slice(0, 80) : e)); }
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 10000); let c;
+    try { const r = await fetch(src, { cache: "no-store", signal: ctl.signal }); if (!r.ok) throw new Error("the server answered " + r.status); c = await r.json(); }
+    catch (e) { throw e && e.name === "AbortError" ? new Error("the server did not answer in 10 s") : e; } finally { clearTimeout(timer); }
+    if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("it does not hold a JSON object");
+    // every field it has is checked first and all are applied only when all pass, so a file is used whole or not at all
+    const L = c.line, fin = (v) => typeof v === "number" && Number.isFinite(v); let nl = null, nz = null, na = null;
+    if (L !== undefined) {
+      if (fin(L) && L > 0 && L < 1) nl = { x1: 0, y1: L, x2: 1, y2: L };
+      else if (L && typeof L === "object" && [L.x1, L.y1, L.x2, L.y2].every(fin)) nl = { x1: clamp01(L.x1), y1: clamp01(L.y1), x2: clamp01(L.x2), y2: clamp01(L.y2) };
+      else throw new Error("line is neither a fraction between 0 and 1 nor {x1, y1, x2, y2}");
+    }
+    if (c.zone !== undefined) {
+      if (!Array.isArray(c.zone) || c.zone.length < 3) throw new Error("zone is not a list of 3 or more points");
+      nz = c.zone.slice(0, 8).map((p, i) => { if (!p || typeof p !== "object" || !fin(p.x) || !fin(p.y)) throw new Error("zone point " + (i + 1) + " is not {x, y}"); return { x: clamp01(p.x), y: clamp01(p.y) }; });
+    }
+    if (c.classes !== undefined) { if (!Array.isArray(c.classes) || !c.classes.length || !c.classes.every((k) => typeof k === "string")) throw new Error("classes is not a list of class names"); na = new Set(c.classes); }
+    if (c.start !== undefined && c.start !== "camera" && c.start !== "sample") throw new Error('start is neither "camera" nor "sample"');
+    if (nl) { line = nl; lineOn = true; } if (nz) zone = nz; if (na) ALLOW = na;
+    CONFIG = c; window.__seedeep.config = c;
+  } catch (e) { CONFIG = null; NOTE = "The counter's settings (" + src.slice(0, 60) + ") could not be used: " + (e && e.message ? e.message.slice(0, 80) : e) + ". It counts without them."; say(""); }
 }
 running = true; requestAnimationFrame(loop);
 applyConfig().then(() => { $("btn-line").setAttribute("aria-pressed", String(lineOn)); $("x-row").hidden = !lineOn; window.__seedeep.lineOn = lineOn; window.__seedeep.line = line; if (zone) { $("btn-zone").setAttribute("aria-pressed", "true"); $("btn-zone").textContent = "Remove the zone"; $("z-row").hidden = false; window.__seedeep.zone = zone; } })
