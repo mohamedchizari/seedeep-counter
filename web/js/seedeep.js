@@ -1,4 +1,4 @@
-// SeeDeep, version 2.7: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
+// SeeDeep, version 2.9: object detection and counting in the viewer's own browser. Nothing leaves the device: the model, the
 // WebAssembly runtime and the sample clip are files from the server that serves this page; the camera and any opened file stay in the page.
 // Detector: MediaPipe Tasks Vision (Apache 2.0), EfficientDet-Lite0 (80 COCO classes). Tracking, the line, the zone and the
 // counting: this file. The line can be dragged by its two ends; a zone (a polygon with draggable corners) counts who is inside and for how long.
@@ -8,8 +8,8 @@ const group = (c) => (c === "person" ? "person" : VEHICLES.has(c) ? "vehicle" : 
 const COLORS = { person: "#f2a516", vehicle: "#1fa3a6", other: "#8a98a8" };
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d"), status = $("status");
-let NOTE = ""; // a settings-file problem, shown whenever nothing else is being said
-const say = (t) => { const s = t || NOTE; status.textContent = s; status.hidden = !s; };
+let NOTE = "", LOADING = ""; // a settings-file problem or the detector's failure to load, and the loading message: shown whenever nothing else is being said
+const say = (t) => { const s = t || [NOTE, LOADING].filter(Boolean).join(" "); status.textContent = s; status.hidden = !s; };
 // a page can carry <body data-config="./config.json">: its line, its zone, the classes it counts, and whether to start on the camera
 let ALLOW = null, CONFIG = null;
 // the line and the zone live in fractions of the frame, so they survive a change of source size
@@ -76,13 +76,13 @@ let t0 = performance.now();
 window.__seedeep = { ready: false, frames: 0, fps: 0, infMs: 0, delegate: null, lastDetections: 0, line, zone: null, lineOn: false, zoneNow: 0 };
 
 async function load() {
-  say((NOTE ? NOTE + " " : "") + "Loading the detector (about 17 MB, once).");
+  LOADING = "Loading the detector (about 17 MB, once)."; say("");
   const { FilesetResolver, ObjectDetector } = await import("/vendor/vision_bundle.mjs");
   const vision = await FilesetResolver.forVisionTasks("/vendor/wasm");
   const opts = (delegate) => ({ baseOptions: { modelAssetPath: "/models/efficientdet_lite0.tflite", delegate }, scoreThreshold: 0.4, maxResults: 25, runningMode: "VIDEO" });
   try { detector = await ObjectDetector.createFromOptions(vision, opts("GPU")); window.__seedeep.delegate = "GPU"; }
   catch (e) { detector = await ObjectDetector.createFromOptions(vision, opts("CPU")); window.__seedeep.delegate = "CPU"; }
-  window.__seedeep.ready = true;
+  window.__seedeep.ready = true; LOADING = "";
   if (status.textContent.includes("Loading the detector")) say("");
   for (const b of ["btn-camera", "btn-file", "btn-line", "btn-zone", "btn-csv"]) $(b).disabled = false;
 }
@@ -101,7 +101,7 @@ function draw(tracks, w, h) {
     ctx.strokeStyle = "rgba(233,237,240,0.95)"; ctx.setLineDash([12 * s, 8 * s]); ctx.lineWidth = 2 * s; ctx.beginPath(); ctx.moveTo(line.x1 * w, line.y1 * h); ctx.lineTo(line.x2 * w, line.y2 * h); ctx.stroke(); ctx.setLineDash([]);
     handle(line.x1 * w, line.y1 * h, s, "#e9edf0"); handle(line.x2 * w, line.y2 * h, s, "#e9edf0");
   }
-  ctx.font = `${12 * s}px Montserrat, system-ui, sans-serif`; ctx.textBaseline = "top"; // Montserrat if the page provides it, else system-ui
+  ctx.font = `${12 * s}px Montserrat, system-ui, sans-serif`; ctx.textBaseline = "top"; // Montserrat if the browser has it (installed, or loaded by a page that embeds this script), else system-ui
   for (const t of tracks) {
     const g = group(t.cls), c = COLORS[g], b = t.box, k = Math.min(b.w, b.h) * 0.22;
     ctx.strokeStyle = c; ctx.lineWidth = 2 * s;
@@ -153,14 +153,14 @@ function step() {
     Object.assign(window.__seedeep, { frames: window.__seedeep.frames + 1, fps, infMs, lastDetections: dets.length });
     draw(tracks, w, h);
     frameOk();
-  } else if (detector && video.paused && (dragging || needsRedraw)) { draw(tracker.tracks.filter((t) => t.misses === 0 && t.hits >= 2), video.videoWidth || canvas.width, video.videoHeight || canvas.height); needsRedraw = false; frameOk(); }
+  } else if (detector && video.paused && (dragging || needsRedraw)) { needsRedraw = false; draw(tracker.tracks.filter((t) => t.misses === 0 && t.hits >= 2), video.videoWidth || canvas.width, video.videoHeight || canvas.height); frameOk(); } // cleared first, so a redraw that fails is not tried again on every frame
 }
 const FRAME_ERR = "A video frame could not be looked at";
 let frameErr = false;
 function frameOk() { if (frameErr) { frameErr = false; if (status.textContent.startsWith(FRAME_ERR)) say(""); } }
 function loop() {
   if (!running) return;
-  try { step(); } catch (e) { if (!frameErr) console.error("SeeDeep: " + FRAME_ERR, e); frameErr = true; say(FRAME_ERR + " (" + (e && e.message ? e.message.slice(0, 120) : e) + "); the page tries again on the next frame."); }
+  try { step(); } catch (e) { if (!frameErr) console.error("SeeDeep: " + FRAME_ERR, e); frameErr = true; say(FRAME_ERR + " (" + (e && e.message ? e.message.slice(0, 120) : e) + "); the page tries again " + (video.paused && !dragging ? "after the next change." : "on the next frame.")); }
   requestAnimationFrame(loop);
 }
 
@@ -201,7 +201,7 @@ function grab(p) {
   return null;
 }
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
-canvas.addEventListener("pointerdown", (ev) => { const p = toFrame(ev); const g = grab(p); if (!g) return; dragging = g; canvas.setPointerCapture(ev.pointerId); ev.preventDefault(); });
+canvas.addEventListener("pointerdown", (ev) => { const p = toFrame(ev); const g = grab(p); if (!g) return; dragging = { ...g, before: JSON.stringify({ line, zone }) }; canvas.setPointerCapture(ev.pointerId); ev.preventDefault(); });
 canvas.addEventListener("pointermove", (ev) => {
   if (!dragging) { const p = toFrame(ev); canvas.style.cursor = grab(p) ? "grab" : "default"; return; }
   const p = toFrame(ev); const fx = clamp01(p.x / p.w), fy = clamp01(p.y / p.h);
@@ -210,7 +210,7 @@ canvas.addEventListener("pointermove", (ev) => {
   else if (dragging.kind === "lineAll") { const dx = (p.x - dragging.p0.x) / p.w, dy = (p.y - dragging.p0.y) / p.h; line = { x1: clamp01(dragging.l0.x1 + dx), y1: clamp01(dragging.l0.y1 + dy), x2: clamp01(dragging.l0.x2 + dx), y2: clamp01(dragging.l0.y2 + dy) }; }
   window.__seedeep.line = line; window.__seedeep.zone = zone; needsRedraw = true;
 });
-const endDrag = (ev) => { if (!dragging) return; if (dragging.kind === "zone") tracker.events.push([Math.max(0, lastT), "", "", "zone moved", "", pass]); else tracker.events.push([Math.max(0, lastT), "", "", "line moved", "", pass]); dragging = null; try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {} remember(); };
+const endDrag = (ev) => { if (!dragging) return; if (JSON.stringify({ line, zone }) !== dragging.before) tracker.events.push([Math.max(0, lastT), "", "", dragging.kind === "zone" ? "zone moved" : "line moved", "", pass]); dragging = null; try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {} remember(); }; // a press that moves nothing leaves no event
 canvas.addEventListener("pointerup", endDrag); canvas.addEventListener("pointercancel", endDrag);
 function remember() { try { localStorage.setItem(STORE_KEY, JSON.stringify({ line, zone, lineOn })); } catch (e) {} }
 const num = (v) => typeof v === "number" && Number.isFinite(v);
@@ -277,4 +277,5 @@ async function applyConfig() {
 running = true; requestAnimationFrame(loop);
 applyConfig().then(() => { $("btn-line").setAttribute("aria-pressed", String(lineOn)); $("x-row").hidden = !lineOn; window.__seedeep.lineOn = lineOn; window.__seedeep.line = line; if (zone) { $("btn-zone").setAttribute("aria-pressed", "true"); $("btn-zone").textContent = "Remove the zone"; $("z-row").hidden = false; window.__seedeep.zone = zone; } })
   .then(load).then(() => (CONFIG && CONFIG.start === "camera" ? useCamera() : useSample()))
-  .catch((e) => say("The detector could not load: " + (e && e.message ? e.message.slice(0, 120) : e) + ". A browser with WebAssembly is needed; if you serve this page yourself, run fetch_assets.sh first."));
+  .catch((e) => { LOADING = ""; const why = e && e.message ? e.message.slice(0, 120).replace(/[.\s]+$/, "") : e && e.target && e.target.src ? new URL(e.target.src).pathname + " did not load" : String(e);
+    NOTE = "The detector could not load: " + why + ". A browser with WebAssembly is needed; if you serve this page yourself, run fetch_assets.sh first." + (NOTE ? " " + NOTE : ""); say(""); }); // kept, so "Sample clip" does not clear it

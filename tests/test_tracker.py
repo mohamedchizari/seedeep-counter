@@ -38,7 +38,7 @@ class Tracking(unittest.TestCase):
         for i, y in enumerate(ys): out = tr.update([det(cls, x, y)], line_y, i / 25)
         return out
 
-    def test_seen_after_three_matched_frames(self):
+    def test_seen_at_three_hits(self):
         tr = Tracker(); self.walk(tr, 'person', [100, 102])
         self.assertEqual(tr.seen, {})
         tr.update([det('person', 100, 104)], 0, 0.12)
@@ -62,7 +62,7 @@ class Tracking(unittest.TestCase):
         self.assertEqual([t['id'] for t in tr.tracks], [1])
 
     def test_a_match_resets_the_misses(self):
-        # 8 misses, a match, 8 more misses: 16 in all but never 12 in a row, so the track lives
+        # 8 misses and a match, twice: 16 misses in all but never more than 8 in a row, so the track lives
         tr = Tracker(); self.walk(tr, 'person', [100, 101])
         for k in range(2):
             for i in range(8): tr.update([], 0, 1 + i / 25)
@@ -94,6 +94,8 @@ class Tracking(unittest.TestCase):
         tr = Tracker(); ys = list(range(180, 341, 20)); self.walk(tr, 'person', ys + ys[::-1], line_y=300)
         self.assertEqual(tr.cross['person'], [1, 1])
         self.assertEqual([e[3] for e in tr.events], ['down', 'up'])
+        # the time and the track of each crossing, which crossings.csv writes: frames 4 and 14 at 25 a second, track 1
+        self.assertEqual([(round(e[0], 2), e[4]) for e in tr.events], [(0.16, 1), (0.56, 1)])
 
     def test_crossing_on_the_third_hit_is_counted(self):
         # centres 280, 290, 302: the line at 300 is passed between the second and the third hit

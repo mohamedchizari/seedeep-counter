@@ -1,31 +1,46 @@
-// A check of the browser page (web/) in headless Google Chrome: the detector loads; the overlay's CSS letterboxes it like
-// the video (object-fit: contain); detections in 5 s do not exceed the frames the video decoded plus 2; things enter the
-// default zone and its mean stay, read twice a second, is always a number, never below zero and above zero at least once;
-// no message with "could not" or "stopped" is seen in those reads; the
-// clip's own loop starts a second pass and the CSV keeps the passes apart; a file that is not a video gets a message;
+// A check of the browser page (web/) in headless Google Chrome, 19 checks. First, the page at the address given must be
+// this repository's: the /js/seedeep.js it serves must be web/js/seedeep.js byte for byte, so that another server left on
+// the port is not checked by mistake; the check stops there if not, and also if the browser cannot be started. Then: the
+// detector loads; the overlay's CSS letterboxes it like the video (object-fit: contain); detections in 5 s do not exceed
+// the frames the video decoded plus 2; things enter the default zone and its mean stay, read twice a second, is always a
+// number, never below zero and above zero at least once; no message with "could not" or "stopped" is seen in those reads;
+// a press on a zone corner or on the line that moves nothing leaves no "moved" event, and a drag of each leaves one;
+// the clip's own loop starts a second pass and the CSV keeps the passes apart; a file that is not a video gets a message;
 // and the page logs no error, refused request or blocked load. A second page is then opened with a settings file whose
 // line, classes and camera start are valid but one zone point is not, a line and zone in local storage that are not
-// valid, and three frames broken on purpose: it should run on the sample with none of that file applied, ignore the
-// stored geometry, keep the settings message, and say, log and then clear the frame error. It takes one to a few
-// minutes, depending on the machine. MediaPipe's own console lines that start "INFO: " (printed through console.error
-// when it makes the CPU detector) are not counted as errors.
+// valid, and three frames broken on purpose: it should run on the sample with no config kept and neither the file's line
+// nor any zone on (the classes are not exposed to the check), ignore the stored geometry, keep the settings message, and
+// say, log and then clear the frame error; then, with the video paused, a redraw that fails must be tried once, not on
+// every animation frame. A third page is opened with the MediaPipe runtime missing (vision_bundle.mjs answered 404): its
+// "could not load" message must stay after "Sample clip" is pressed. It takes one to a few minutes, depending on the
+// machine. MediaPipe's own console lines that start "INFO: " (printed through console.error when it makes the CPU
+// detector) are not counted as errors.
 // Needs: the page served (python3 web/serve.py), Node 18+, `npm install playwright-core`, and Google Chrome (Playwright's
 // own Chromium does not play the H.264 sample clip).
 // usage: CHROME="/path/to/Google Chrome" node tests/web_check.mjs [http://127.0.0.1:8000/]
-// env: CHROME (the browser to run), PLAYWRIGHT_MODULE (where playwright-core is, if not installed beside this repo),
-//      ALLOW_CONSOLE (a regular expression for console errors and failed requests to ignore)
+// env: CHROME (the browser to run), PLAYWRIGHT_MODULE (the path to playwright-core's index.mjs, if playwright-core is not
+//      installed beside this repo), ALLOW_CONSOLE (a regular expression for console errors and failed requests to ignore)
 import fs from "node:fs";
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || "playwright-core");
 const url = process.argv[2] || "http://127.0.0.1:8000/";
 const allow = process.env.ALLOW_CONSOLE ? new RegExp(process.env.ALLOW_CONSOLE) : null;
-const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: true, args: ["--autoplay-policy=no-user-gesture-required"] });
+let fails = 0;
+const check = (ok, what) => { console.log((ok ? "PASS " : "FAIL ") + what); if (!ok) fails += 1; };
+const end = () => { console.log(fails ? `${fails} check(s) failed` : "all checks passed"); process.exit(fails ? 1 : 0); };
+const mine = fs.readFileSync(new URL("../web/js/seedeep.js", import.meta.url));
+const served = await fetch(new URL("/js/seedeep.js", url)).then(async (r) => (r.ok ? Buffer.from(await r.arrayBuffer()) : "the server answered " + r.status), (e) => String((e && e.cause) || e));
+const same = Buffer.isBuffer(served) && served.equals(mine);
+check(same, `the page at ${url} is this repository's (its /js/seedeep.js is web/js/seedeep.js${same ? "" : Buffer.isBuffer(served) ? "; it differs, so another page may be on that port" : "; " + served.slice(0, 120)})`);
+if (!same) end();
+let browser;
+try {
+  const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || "playwright-core");
+  browser = await chromium.launch({ executablePath: process.env.CHROME || undefined, headless: true, args: ["--autoplay-policy=no-user-gesture-required"] });
+} catch (e) { check(false, "the browser started (" + String(e).slice(0, 200) + ")"); end(); }
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
 const problems = [];
 page.on("pageerror", (e) => problems.push("page error: " + String(e)));
 page.on("console", (m) => { if (m.type() === "error" && !/^INFO: /.test(m.text()) && !(allow && allow.test(m.text()))) problems.push("console: " + m.text()); });
 page.on("requestfailed", (r) => { if (!(allow && allow.test(r.url()))) problems.push("request failed: " + r.url() + " " + (r.failure() || {}).errorText); });
-let fails = 0;
-const check = (ok, what) => { console.log((ok ? "PASS " : "FAIL ") + what); if (!ok) fails += 1; };
 try {
   await page.goto(url, { waitUntil: "load", timeout: 60000 });
   const ready = await page.waitForFunction(() => window.__seedeep && window.__seedeep.ready && window.__seedeep.frames > 30, null, { timeout: 120000 }).then(() => true, () => false);
@@ -51,8 +66,13 @@ try {
   check(entered > 0, `things entered the zone (${entered})`);
   check(notNumber === 0 && minStay >= 0 && maxStay > 0, `the zone's mean stay, read every 0.5 s (${reads} reads), was always a number, never below zero and above zero at least once (lowest ${minStay} s, highest ${maxStay} s${notNumber ? `, ${notNumber} reads not a number` : ""})`);
   check(banners.size === 0, `no error message on the page while it counted${banners.size ? ` ("${[...banners][0]}")` : ""}`);
+  // a press that moves nothing, then a drag by 20 px, on a zone corner and on the middle of the line: the drag shows the press was on it
+  const at = (which) => page.evaluate((which) => { const c = document.getElementById("overlay"), r = c.getBoundingClientRect(), w = c.width, h = c.height, sc = Math.min(r.width / w, r.height / h), L = window.__seedeep.line, q = which === "corner" ? window.__seedeep.zone[0] : { x: (L.x1 + L.x2) / 2, y: (L.y1 + L.y2) / 2 }; return { x: r.left + (r.width - w * sc) / 2 + q.x * w * sc, y: r.top + (r.height - h * sc) / 2 + q.y * h * sc }; }, which);
+  const press = async (p, dy) => { await page.mouse.move(p.x, p.y); await page.mouse.down(); if (dy) await page.mouse.move(p.x, p.y + dy, { steps: 4 }); await page.mouse.up(); };
+  await press(await at("corner"), 0); await press(await at("corner"), 20); await press(await at("line"), 0); await press(await at("line"), 20);
   const [dl] = await Promise.all([page.waitForEvent("download", { timeout: 20000 }), page.click("#btn-csv")]);
-  const lines = fs.readFileSync(await dl.path(), "utf8").split("\n");
+  const text = fs.readFileSync(await dl.path(), "utf8"), lines = text.split("\n"), moved = (what) => text.split(`"${what}"`).length - 1;
+  check(moved("zone moved") === 1 && moved("line moved") === 1, `a press that moves nothing leaves no "moved" event, and a drag of a zone corner and of the line leaves one each ("zone moved" ${moved("zone moved")}, "line moved" ${moved("line moved")})`);
   const head = lines[0].split(",").map((x) => x.replace(/"/g, ""));
   check(head.join(",") === "second,people_in_frame_max,vehicles_in_frame_max,other_in_frame_max,in_zone_max,frames_seen,pass", "the CSV header");
   const passes = new Set(); for (const l of lines.slice(1)) { const c = l.split(",").map((x) => x.replace(/"/g, "")); if (c.length === 7 && /^\d+$/.test(c[0])) passes.add(c[6]); else break; }
@@ -91,7 +111,23 @@ try {
   const f = await page2.evaluate(() => ({ said: window.__said, now: document.getElementById("status").textContent, more: window.__seedeep.frames - window.__f0, left: window.__breakFrames }));
   const shown = f.said.some((t) => /^A video frame could not be looked at/.test(t)), cleared = !/^A video frame could not be looked at/.test(f.now) && /settings .* could not be used/.test(f.now), inLog = logged.some((t) => /could not be looked at/.test(t));
   check(f.left === 0 && shown && cleared && inLog && f.more > 10, `three broken frames: the error is said (${shown}), logged (${inLog}), and cleared on a good frame back to the settings message (${cleared}); ${f.more} good frames after`);
+  const tries = await page2.evaluate(async () => {  // the video paused, the line switched on, every drawing broken for 1 s
+    const v = document.getElementById("video"), wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+    v.pause(); await wait(300); window.__breakFrames = 1000; document.getElementById("btn-line").click(); await wait(1000);
+    const n = 1000 - window.__breakFrames; window.__breakFrames = 0; document.getElementById("btn-line").click(); return n;
+  });
+  check(tries === 1, `with the video paused, a redraw that fails is tried once, not on every animation frame (${tries} tries in 1 s)`);
 } catch (e) { check(false, "the second page: " + String(e).slice(0, 200)); }
+
+// the third page: the MediaPipe runtime is missing, so the detector cannot load; pressing "Sample clip" must not clear that
+try {
+  const page3 = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  await page3.route((u) => u.pathname === "/vendor/vision_bundle.mjs", (route) => route.fulfill({ status: 404, contentType: "text/plain", body: "" }));
+  await page3.goto(url, { waitUntil: "load", timeout: 60000 });
+  const failed = await page3.waitForFunction(() => /^The detector could not load/.test(document.getElementById("status").textContent), null, { timeout: 30000 }).then(() => true, () => false);
+  await page3.click("#btn-sample"); await page3.waitForTimeout(1500);
+  const said = await page3.evaluate(() => { const s = document.getElementById("status"); return s.hidden ? "" : s.textContent; });
+  check(failed && /^The detector could not load/.test(said), `with the runtime missing, the page says the detector could not load, and still says so after "Sample clip" is pressed ("${said.slice(0, 150)}")`);
+} catch (e) { check(false, "the third page: " + String(e).slice(0, 200)); }
 await browser.close();
-console.log(fails ? `${fails} check(s) failed` : "all checks passed");
-process.exit(fails ? 1 : 0);
+end();
