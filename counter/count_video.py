@@ -3,13 +3,18 @@
 page in web/ (MediaPipe EfficientDet-Lite0, score 0.4, 25 per frame), same tracker rules (tracker.py), one horizontal line.
 usage: python count_video.py IN.mp4 OUT_DIR [--line 0.62] [--every 1] [--max-minutes 60] [--title "name"] [--line-text "the doorway"]
        [--model PATH] [--ffmpeg NAME_OR_PATH] [--no-video]
-writes: counts_per_second.csv, counts_per_minute.csv, seen_by_class.csv, crossings.csv, summary.json, annotated.mp4, summary.pdf, README.txt
+writes, in this order: counts_per_second.csv, counts_per_minute.csv, seen_by_class.csv, crossings.csv, summary.json, summary.pdf,
+annotated.mp4, README.txt
 The model is fetched by ../fetch_assets.sh; ffmpeg (optional) re-encodes the annotated video to H.264."""
 import argparse, csv, json, os, sys, time, subprocess, datetime, shutil
 import cv2, numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mptasks
 from mediapipe.tasks.python import vision
+try:
+    import reportlab  # used for summary.pdf; checked here so a missing one stops the run before it starts
+except ImportError:
+    reportlab = None
 from tracker import Tracker, group, VEHICLES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,11 +43,14 @@ def main():
     if not 0 <= a.line < 1: ap.error('--line must be 0 (no line) or a fraction of the height below 1')
     if a.max_minutes <= 0: ap.error('--max-minutes must be above 0')
     if not os.path.exists(a.model): print('model not found:', a.model, '(run ./fetch_assets.sh from the repository root)'); sys.exit(2)
-    os.makedirs(a.out, exist_ok=True); cap = cv2.VideoCapture(a.inp)
-    raw, final = os.path.join(a.out, '_annotated_raw.mp4'), os.path.join(a.out, 'annotated.mp4')
-    for old in (raw, final):
-        if os.path.exists(old): os.remove(old)  # never leave an earlier run's video beside this run's tables
+    if reportlab is None: print('ReportLab is not installed (pip install -r counter/requirements.txt)'); sys.exit(2)
+    cap = cv2.VideoCapture(a.inp)
     if not cap.isOpened(): print('cannot open', a.inp); sys.exit(2)
+    os.makedirs(a.out, exist_ok=True)
+    raw, final = os.path.join(a.out, '_annotated_raw.mp4'), os.path.join(a.out, 'annotated.mp4')
+    OUTPUTS = ('counts_per_second.csv', 'counts_per_minute.csv', 'seen_by_class.csv', 'crossings.csv', 'summary.json', 'summary.pdf', 'annotated.mp4', 'README.txt', '_annotated_raw.mp4')
+    for name in OUTPUTS:  # the input opened, so an earlier run's outputs go: none of them can sit beside this run's
+        if os.path.exists(os.path.join(a.out, name)): os.remove(os.path.join(a.out, name))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25; W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     limit = a.max_minutes * 60  # stop at the end of the file or here; the frame count in a file's header can be wrong or negative
     line_y = H * a.line if a.line else 0
@@ -52,7 +60,7 @@ def main():
     if not a.no_video:
         writer = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), fps / a.every, (W, H))
         if not writer.isOpened(): print('the annotated video cannot be written here; going on without it', flush=True); writer = None
-    per_sec = {}; per_min = {}; frames = 0; i = 0; t0 = time.time(); inf_ms = []
+    per_sec = {}; per_min = {}; frames = 0; i = 0; t0 = time.time(); inf_ms = []; last_ms = -1
     while True:
         ok, frame = cap.read()
         if not ok: break
@@ -60,7 +68,8 @@ def main():
         if t_s > limit: break
         if i % a.every: i += 1; continue
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB); mpi = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        a0 = time.time(); res = det.detect_for_video(mpi, int(t_s * 1000)); inf_ms.append((time.time() - a0) * 1000)
+        ms = max(int(t_s * 1000), last_ms + 1); last_ms = ms
+        a0 = time.time(); res = det.detect_for_video(mpi, ms); inf_ms.append((time.time() - a0) * 1000)
         dets = [{'cls': d.categories[0].category_name, 'score': d.categories[0].score, 'box': (d.bounding_box.origin_x, d.bounding_box.origin_y, d.bounding_box.width, d.bounding_box.height)} for d in res.detections]
         tracks = tr.update(dets, line_y, t_s)
         now = {'person': 0, 'vehicle': 0, 'other': 0}
@@ -102,20 +111,28 @@ def main():
                'crossings': {'person': {'down': tr.cross['person'][0], 'up': tr.cross['person'][1]}, 'vehicle': {'down': tr.cross['vehicle'][0], 'up': tr.cross['vehicle'][1]}},
                'peak_people_in_frame': {'count': peak_p[1]['person'], 'second': peak_p[0]}, 'peak_vehicles_in_frame': {'count': peak_v[1]['vehicle'], 'second': peak_v[0]}}
     json.dump(summary, open(os.path.join(a.out, 'summary.json'), 'w'), indent=1)
-    pdf(summary, per_min, ev_by_min, os.path.join(a.out, 'summary.pdf'))
+    has_pdf = False
+    try:
+        pdf(summary, per_min, ev_by_min, os.path.join(a.out, 'summary.pdf')); has_pdf = True
+    except Exception as e:  # the tables and the video still count without the PDF
+        print('summary.pdf could not be written:', e, flush=True)
+        if os.path.exists(os.path.join(a.out, 'summary.pdf')): os.remove(os.path.join(a.out, 'summary.pdf'))
     # the annotated video: re-encoded to H.264 when an ffmpeg is found and works, else kept as written (MPEG-4 Part 2)
     if writer is not None and os.path.exists(raw):
         ff = shutil.which(a.ffmpeg) if a.ffmpeg else None; encoded = False
         if ff:
-            r = subprocess.run([ff, '-y', '-loglevel', 'error', '-i', raw, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', final], check=False)
-            encoded = r.returncode == 0 and os.path.exists(final)
+            try:
+                r = subprocess.run([ff, '-nostdin', '-y', '-loglevel', 'error', '-i', raw, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', final], check=False)
+                encoded = r.returncode == 0 and os.path.exists(final)
+            except OSError as e:
+                print('ffmpeg could not be run:', e, flush=True)
             if not encoded: print('ffmpeg did not finish; the annotated video stays MPEG-4 Part 2', flush=True)
         elif a.ffmpeg: print('ffmpeg not found (' + a.ffmpeg + '); the annotated video stays MPEG-4 Part 2', flush=True)
         if encoded: os.remove(raw)
         else:
             if os.path.exists(final): os.remove(final)
             os.rename(raw, final)
-    open(os.path.join(a.out, 'README.txt'), 'w').write('SeeDeep video counts\n\ncounts_per_second.csv: the most people, vehicles and other things in frame in each second.\ncounts_per_minute.csv: per minute, the most and the average in frame, and the line crossings.\nseen_by_class.csv: how many tracked things of each class were seen (a thing the detector loses for more than 12 frames and finds again counts twice; two that swap places can count as one).\ncrossings.csv: every crossing of the line with its time, direction and track.\n' + ('annotated.mp4: the video with the boxes and the line drawn.\n' if os.path.exists(final) else '') + 'summary.pdf and summary.json: the totals, the peaks, the method and its limits.\n\nDetector: MediaPipe EfficientDet-Lite0 (Apache 2.0), 80 COCO classes; it does not read faces, plates or text. Counts can be wrong' + ('; the annotated video is there so you can judge' if os.path.exists(final) else '') + '.\n')
+    open(os.path.join(a.out, 'README.txt'), 'w').write('SeeDeep video counts\n\ncounts_per_second.csv: the most people, vehicles and other things in frame in each second.\ncounts_per_minute.csv: per minute, the most and the average in frame, and the line crossings.\nseen_by_class.csv: how many tracked things of each class were seen (a thing the detector loses for more than 12 frames and finds again counts twice; two things close together can be seen as one, and two that pass each other can swap tracks).\ncrossings.csv: every crossing of the line with its time, direction and track.\n' + ('annotated.mp4: the video with the boxes and the line drawn.\n' if os.path.exists(final) else '') + ('summary.pdf and summary.json' if has_pdf else 'summary.json') + ': the totals, the peaks, the method and its limits.\n\nDetector: MediaPipe EfficientDet-Lite0 (Apache 2.0), 80 COCO classes; it does not read faces, plates or text. Counts can be wrong' + ('; the annotated video is there so you can judge' if os.path.exists(final) else '') + '.\n')
     print(json.dumps({k: summary[k] for k in ('frames_processed', 'duration_s', 'ms_per_detection_mean', 'people_seen', 'vehicles_seen', 'crossings', 'peak_people_in_frame')}))
 
 def pdf(s, per_min, ev, path):
@@ -123,10 +140,22 @@ def pdf(s, per_min, ev, path):
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import inch
     c = canvas.Canvas(path, pagesize=letter); Wp, Hp = letter; y = Hp - inch
-    def line(txt, size=11, dy=16, bold=False):
+    def line(txt, size=11, dy=16, bold=False, mono=False):
         nonlocal y
-        if y < inch: c.showPage(); y = Hp - inch
-        c.setFont('Helvetica-Bold' if bold else 'Helvetica', size); c.drawString(inch, y, txt); y -= dy
+        font = ('Courier' if mono else 'Helvetica') + ('-Bold' if bold else ''); parts = [txt]
+        if c.stringWidth(txt, font, size) > Wp - 2 * inch:
+            parts = ['']
+            for w in txt.split(' '):
+                trial = (parts[-1] + ' ' + w) if parts[-1] else w
+                if parts[-1] and c.stringWidth(trial, font, size) > Wp - 2 * inch: parts.append(w)
+                else: parts[-1] = trial
+            while c.stringWidth(parts[-1], font, size) > Wp - 2 * inch:  # a single word wider than the page
+                k = len(parts[-1])
+                while k > 1 and c.stringWidth(parts[-1][:k], font, size) > Wp - 2 * inch: k -= 1
+                parts[-1:] = [parts[-1][:k], parts[-1][k:]]
+        for k, part in enumerate(parts):
+            if y < inch: c.showPage(); y = Hp - inch
+            c.setFont(font, size); c.drawString(inch, y, part); y -= dy if k == len(parts) - 1 else size + 4
     line('SeeDeep video counts', 20, 28, True)
     line(f"{s['input']}" + (f" for {s['title']}" if s['title'] else '') + f", made {s['made'][:16].replace('T', ' ')} UTC", 11, 22)
     line('What was counted', 14, 20, True)
@@ -137,20 +166,20 @@ def pdf(s, per_min, ev, path):
     y -= 6; line('Seen, by class', 14, 20, True)
     for cls, n in sorted(s['seen'].items(), key=lambda x: -x[1])[:16]: line(f"{cls}: {n}", 11, 14)
     y -= 6; line('By minute (most in frame; crossings)', 14, 20, True)
-    line('minute   people   vehicles   people down/up   vehicles down/up', 10, 14, True)
+    line('minute   people   vehicles   people down/up   vehicles down/up', 9, 14, True, True)
     for m in sorted(per_min):
         r = per_min[m]; e = ev.get(m, {'person_down': 0, 'person_up': 0, 'vehicle_down': 0, 'vehicle_up': 0})
-        line(f"{m:>6}   {r['person_max']:>6}   {r['vehicle_max']:>8}   {e['person_down']:>6} / {e['person_up']:<6}   {e['vehicle_down']:>6} / {e['vehicle_up']}", 10, 13)
+        line(f"{m:>6}   {r['person_max']:>6}   {r['vehicle_max']:>8}   {e['person_down']:>6} / {e['person_up']:<6}   {e['vehicle_down']:>6} / {e['vehicle_up']}", 9, 13, False, True)
     # a small bar chart of people per minute
     if per_min:
         if y < 3 * inch: c.showPage(); y = Hp - inch
         y -= 10; line('People in frame, most per minute', 12, 16, True)
         mx = max(r['person_max'] for r in per_min.values()) or 1; n = len(per_min); bw = min(18, (Wp - 2 * inch) / max(1, n)); base = y - 110
         c.setFillColorRGB(0.95, 0.65, 0.09)
-        for j, m in enumerate(sorted(per_min)): h = 100 * per_min[m]['person_max'] / mx; c.rect(inch + j * bw, base, bw - 2, h, fill=1, stroke=0)
+        for j, m in enumerate(sorted(per_min)): h = 100 * per_min[m]['person_max'] / mx; c.rect(inch + j * bw, base, max(bw * 0.8, bw - 2), h, fill=1, stroke=0)
         c.setFillColorRGB(0, 0, 0); c.setFont('Helvetica', 8); c.drawString(inch, base - 12, f"minute 0 to {n - 1}; tallest bar = {mx}"); y = base - 30
     y -= 6; line('Method and limits', 14, 20, True)
-    for t in [f"Detector: {s['detector']} (MediaPipe, Google, Apache 2.0; 80 everyday classes; it does not read faces, plates or text).", f"Tracking: {s['tracker']}. A thing the detector loses for more than 12 frames and finds again counts twice; two that swap places can count as one.", f"Speed on the machine that made this: {s['ms_per_detection_mean']} ms a detection.", 'Accuracy was not measured on this footage; the annotated video is included so you can judge the counts yourself. Counts can be wrong.', 'Made by count_video.py on the machine that ran it; the script itself makes no network request.']:
+    for t in [f"Detector: {s['detector']} (MediaPipe, Google, Apache 2.0; 80 everyday classes; it does not read faces, plates or text).", f"Tracking: {s['tracker']}. A thing the detector loses for more than 12 frames and finds again counts twice; two things close together can be seen as one, and two that pass each other can swap tracks.", f"Speed on the machine that made this: {s['ms_per_detection_mean']} ms a detection.", 'Accuracy was not measured on this footage; the annotated video is included so you can judge the counts yourself. Counts can be wrong.', 'Made by count_video.py on the machine that ran it; the script itself makes no network request.']:
         words = t.split(); buf = ''
         for w in words:
             if c.stringWidth(buf + ' ' + w, 'Helvetica', 10) > Wp - 2 * inch: line(buf, 10, 13); buf = w

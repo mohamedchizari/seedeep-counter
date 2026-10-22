@@ -13,6 +13,7 @@ MUTATIONS = [
     ("; t['misses'] = 0\n", "\n"),                                       # a match resets the misses
     ("if t['misses'] == 0 and t['hits'] >= 2]", "if t['misses'] <= 1 and t['hits'] >= 2]"),  # drawn only when matched now
     ("t['hits'] >= 3 and g in", "t['hits'] >= 2 and g in"),                # crossings from the third hit
+    ("t['hits'] >= 3 and g in", "t['hits'] >= 4 and g in"),
     ("t['misses'] <= 12]", "t['misses'] <= 11]"),                          # dropped after 12 misses
     ("t['hits'] >= 3: t['counted']", "t['hits'] >= 2: t['counted']"),      # seen at 3 hits
     ("pairs.sort(key=lambda p: -p[0])", "pairs.sort(key=lambda p: p[0])"),  # best overlap first
@@ -29,7 +30,7 @@ for old, new in MUTATIONS:
     try:
         shutil.copytree(ROOT, os.path.join(d, 'r'), ignore=shutil.ignore_patterns('.git', '.venv', 'venv', '__pycache__', 'models', 'vendor', 'out', '*.mp4'))
         open(os.path.join(d, 'r', 'counter', 'tracker.py'), 'w', encoding='utf-8').write(SRC.replace(old, new))
-        r = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'], cwd=os.path.join(d, 'r'), capture_output=True, text=True)  # -B and no copied __pycache__: a compiled copy of the unchanged file could be run instead (seen once)
+        r = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'], cwd=os.path.join(d, 'r'), capture_output=True, text=True)  # -B and no copied __pycache__, so the changed tracker.py is the one that runs
     finally:
         shutil.rmtree(d, ignore_errors=True)
     hit = r.returncode != 0; caught += hit

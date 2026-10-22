@@ -1,4 +1,5 @@
-# The versions the counter was last run with, on Python 3.9. Other versions were not tried.
+# The versions the counter was last run with, on Python 3.9. numpy 2.0.2 installs from wheels on Python 3.9 to 3.12 only;
+# on a newer Python, pip would build it from source. Other versions were not tried.
 # OpenCV is the contrib build because mediapipe itself installs that one; two OpenCV packages would share cv2/.
 mediapipe==1.1.1
 opencv-contrib-python==5.0.0.93

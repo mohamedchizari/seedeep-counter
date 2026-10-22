@@ -1,8 +1,7 @@
-// SeeDeep, version 2.3: object detection and counting in the visitor's own browser. Nothing leaves the device: the model, the
+// SeeDeep, version 2.5: object detection and counting in the visitor's own browser. Nothing leaves the device: the model, the
 // WebAssembly runtime and the sample clip are files on this site; the camera and any opened file stay in the page.
 // Detector: MediaPipe Tasks Vision (Apache 2.0), EfficientDet-Lite0 (80 COCO classes). Tracking, the line, the zone and the
 // counting: this file. The line can be dragged by its two ends; a zone (a polygon with draggable corners) counts who is inside and for how long.
-import { FilesetResolver, ObjectDetector } from "/vendor/vision_bundle.mjs";
 
 const VEHICLES = new Set(["car", "truck", "bus", "motorcycle", "bicycle", "train"]);
 const group = (c) => (c === "person" ? "person" : VEHICLES.has(c) ? "vehicle" : "other");
@@ -43,12 +42,12 @@ class Tracker {
       const g = group(t.cls);
       if (L && t.hits >= 3 && (g === "person" || g === "vehicle")) {
         const s0 = sideOf(c0, L, w, h), s1 = sideOf(c1, L, w, h), a = alongLine(c1, L, w, h);
-        if (a >= 0 && a <= 1) { if (s0 < 0 && s1 >= 0) { this.crossings[g].down += 1; this.events.push([t_s, g, t.cls, "down", t.id]); } else if (s0 >= 0 && s1 < 0) { this.crossings[g].up += 1; this.events.push([t_s, g, t.cls, "up", t.id]); } }
+        if (a >= 0 && a <= 1) { if (s0 < 0 && s1 >= 0) { this.crossings[g].down += 1; this.events.push([t_s, g, t.cls, "down", t.id, pass]); } else if (s0 >= 0 && s1 < 0) { this.crossings[g].up += 1; this.events.push([t_s, g, t.cls, "up", t.id, pass]); } }
       }
       if (poly && t.hits >= 3) {
         const inside = inPoly(c1, poly, w, h);
-        if (inside && !t.inZone) { t.inZone = true; t.zoneSince = t_s; this.zoneEntered += 1; this.events.push([t_s, g, t.cls, "entered", t.id]); }
-        else if (!inside && t.inZone) { t.inZone = false; this.zoneStays.push(t_s - t.zoneSince); this.events.push([t_s, g, t.cls, "left", t.id]); }
+        if (inside && !t.inZone) { t.inZone = true; t.zoneSince = t_s; this.zoneEntered += 1; this.events.push([t_s, g, t.cls, "entered", t.id, pass]); }
+        else if (!inside && t.inZone) { t.inZone = false; this.zoneStays.push(t_s - t.zoneSince); this.events.push([t_s, g, t.cls, "left", t.id, pass]); }
       }
     }
     this.tracks.forEach((t, ti) => { if (!matchedT.has(ti)) t.misses += 1; });
@@ -58,13 +57,18 @@ class Tracker {
     return this.tracks.filter((t) => t.misses === 0 && t.hits >= 2);
   }
   zoneNow() { return this.tracks.filter((t) => t.misses === 0 && t.inZone).length; }
-  restart() { for (const t of this.tracks) if (t.inZone) { this.zoneStays.push(t.lastSeen - t.zoneSince); this.events.push([t.lastSeen, group(t.cls), t.cls, "left", t.id]); } this.tracks = []; }
-  newZone(t_s) { this.zoneEntered = 0; this.zoneStays = []; for (const t of this.tracks) t.inZone = false; this.events.push([t_s, "", "", "zone changed", ""]); }
+  restart() { for (const t of this.tracks) if (t.inZone) { this.zoneStays.push(t.lastSeen - t.zoneSince); this.events.push([t.lastSeen, group(t.cls), t.cls, "left", t.id, pass]); } this.tracks = []; }
+  newZone(t_s) { for (const t of this.tracks) if (t.inZone) { this.events.push([t.lastSeen, group(t.cls), t.cls, "left", t.id, pass]); t.inZone = false; } this.zoneEntered = 0; this.zoneStays = []; this.events.push([t_s, "", "", "zone changed", "", pass]); }
   meanStay(t_s) { const all = this.zoneStays.concat(this.tracks.filter((t) => t.inZone).map((t) => t_s - t.zoneSince)); return all.length ? all.reduce((a, b) => a + b, 0) / all.length : 0; }
 }
 
 // ---- state
-let detector = null, tracker = new Tracker(), source = "sample", running = false, lastT = -1, prevT = 0, pass = 1, fileURL = null;
+let detector = null, tracker = new Tracker(), source = "sample", running = false, lastT = -1, prevT = 0, pass = 1, fileURL = null, zoneHistory = [];
+// one detection per new video frame where the browser says when one is shown; otherwise whenever the video clock moves
+const RVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+let newFrame = false, frameTime = 0;
+function onFrame(now, meta) { newFrame = true; frameTime = meta.mediaTime; video.requestVideoFrameCallback(onFrame); }
+if (RVFC) video.requestVideoFrameCallback(onFrame);
 let fps = 0, infMs = 0, frames = 0;
 const perSecond = new Map(); // "pass:second" -> {pass, sec, person, vehicle, other, zone, n}; a loop of the sample starts a new pass
 let t0 = performance.now();
@@ -72,12 +76,13 @@ window.__seedeep = { ready: false, frames: 0, fps: 0, infMs: 0, delegate: null, 
 
 async function load() {
   say("Loading the detector (about 17 MB, once).");
+  const { FilesetResolver, ObjectDetector } = await import("/vendor/vision_bundle.mjs");
   const vision = await FilesetResolver.forVisionTasks("/vendor/wasm");
   const opts = (delegate) => ({ baseOptions: { modelAssetPath: "/models/efficientdet_lite0.tflite", delegate }, scoreThreshold: 0.4, maxResults: 25, runningMode: "VIDEO" });
   try { detector = await ObjectDetector.createFromOptions(vision, opts("GPU")); window.__seedeep.delegate = "GPU"; }
   catch (e) { detector = await ObjectDetector.createFromOptions(vision, opts("CPU")); window.__seedeep.delegate = "CPU"; }
   window.__seedeep.ready = true;
-  say("");
+  if (status.textContent.startsWith("Loading the detector")) say("");
   for (const b of ["btn-camera", "btn-file", "btn-line", "btn-zone", "btn-csv"]) $(b).disabled = false;
 }
 
@@ -112,26 +117,26 @@ function draw(tracks, w, h) {
   }
 }
 
-function paintCounts(tracks) {
+function paintCounts(tracks, t_s) {
   const now = { person: 0, vehicle: 0, other: 0 };
   for (const t of tracks) now[group(t.cls)] += 1;
   $("n-person").textContent = now.person; $("n-vehicle").textContent = now.vehicle; $("n-other").textContent = now.other;
   const cr = tracker.crossings;
   $("x-person").textContent = `${cr.person.down} down, ${cr.person.up} up`; $("x-vehicle").textContent = `${cr.vehicle.down} down, ${cr.vehicle.up} up`;
   const zn = zone ? tracker.zoneNow() : 0; window.__seedeep.zoneNow = zn;
-  if (zone) { $("z-now").textContent = zn; $("z-entered").textContent = tracker.zoneEntered; $("z-stay").textContent = tracker.meanStay(video.currentTime).toFixed(1) + " s"; }
+  if (zone) { $("z-now").textContent = zn; $("z-entered").textContent = tracker.zoneEntered; $("z-stay").textContent = tracker.meanStay(t_s).toFixed(1) + " s"; }
   const seen = Object.entries(tracker.seen).sort((a, b) => b[1] - a[1]).slice(0, 12);
   const ul = $("seen-list"); ul.textContent = "";
   for (const [cls, n] of seen) { const li = document.createElement("li"); li.append(Object.assign(document.createElement("span"), { textContent: cls }), Object.assign(document.createElement("b"), { textContent: n })); ul.append(li); }
   $("m-fps").textContent = fps.toFixed(0); $("m-ms").textContent = infMs.toFixed(0);
-  const sec = Math.floor(video.currentTime), key = pass + ":" + sec; const row = perSecond.get(key) || { pass, sec, person: 0, vehicle: 0, other: 0, zone: 0, n: 0 };
+  const sec = Math.floor(t_s), key = pass + ":" + sec; const row = perSecond.get(key) || { pass, sec, person: 0, vehicle: 0, other: 0, zone: 0, n: 0 };
   row.person = Math.max(row.person, now.person); row.vehicle = Math.max(row.vehicle, now.vehicle); row.other = Math.max(row.other, now.other); row.zone = Math.max(row.zone, zn); row.n += 1; perSecond.set(key, row);
 }
 
-function loop() {
-  if (!running) return;
-  if (detector && video.readyState >= 2 && !video.paused && video.currentTime !== lastT) {
-    const t_s = video.currentTime, dt = lastT < 0 || t_s < prevT ? 0 : t_s - prevT;
+function step() {
+  if (detector && video.readyState >= 2 && !video.paused && (RVFC ? newFrame : video.currentTime !== lastT)) {
+    newFrame = false;
+    const t_s = RVFC ? frameTime : video.currentTime, dt = lastT < 0 || t_s < prevT ? 0 : t_s - prevT;
     if (lastT >= 0 && t_s < prevT) { tracker.restart(); pass += 1; }
     lastT = t_s; prevT = t_s;
     const a = performance.now();
@@ -142,24 +147,31 @@ function loop() {
     if (ALLOW) dets = dets.filter((d) => ALLOW.has(d.cls));
     const w = video.videoWidth, h = video.videoHeight;
     const tracks = tracker.update(dets, w, h, lineOn ? line : null, zone, t_s, dt);
-    draw(tracks, w, h); paintCounts(tracks);
+    draw(tracks, w, h); paintCounts(tracks, t_s);
     frames += 1; const dtp = (b - t0) / 1000; if (dtp >= 1) { fps = frames / dtp; frames = 0; t0 = b; }
     Object.assign(window.__seedeep, { frames: window.__seedeep.frames + 1, fps, infMs, lastDetections: dets.length });
   } else if (detector && video.paused && (dragging || needsRedraw)) { needsRedraw = false; draw(tracker.tracks.filter((t) => t.misses === 0 && t.hits >= 2), video.videoWidth || canvas.width, video.videoHeight || canvas.height); }
+}
+function loop() {
+  if (!running) return;
+  try { step(); } catch (e) { say("The detector stopped on this video: " + (e && e.message ? e.message.slice(0, 120) : e)); }
   requestAnimationFrame(loop);
 }
 
-function reset() { tracker = new Tracker(); perSecond.clear(); lastT = -1; prevT = 0; pass = 1; fps = 0; infMs = 0; frames = 0; t0 = performance.now(); ctx.clearRect(0, 0, canvas.width, canvas.height); }
+function reset() { tracker = new Tracker(); perSecond.clear(); lastT = -1; prevT = 0; pass = 1; zoneHistory = []; newFrame = false; fps = 0; infMs = 0; frames = 0; t0 = performance.now(); ctx.clearRect(0, 0, canvas.width, canvas.height); }
 function stopStream() { if (video.srcObject) { video.srcObject.getTracks().forEach((t) => t.stop()); video.srcObject = null; } }
 function pressed(id) { for (const b of ["btn-sample", "btn-camera", "btn-file"]) $(b).setAttribute("aria-pressed", String(b === id)); }
 
-async function useSample() { stopStream(); reset(); source = "sample"; pressed("btn-sample"); video.loop = true; video.muted = true; video.src = "/assets/sample_crosswalk_960.mp4"; await video.play().catch(() => {}); say(""); }
+async function useSample() { stopStream(); reset(); source = "sample"; pressed("btn-sample"); video.loop = true; video.muted = true; video.src = "/assets/sample_crosswalk_960.mp4"; await video.play().catch(() => {}); if (!video.error) say(""); }
 async function useCamera() {
+  let stream = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1280 } }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1280 } }, audio: false });
+    stream.getVideoTracks().forEach((tr) => tr.addEventListener("ended", () => { if (source === "camera") say("The camera stopped. Press \"Use my camera\" to start it again."); }));
     stopStream(); reset(); source = "camera"; pressed("btn-camera"); video.loop = false; video.removeAttribute("src"); video.srcObject = stream; await video.play(); say("Your camera, on this device only. Nothing is sent anywhere.");
   } catch (e) {
     const n = e && e.name;
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); if (video.srcObject === stream) video.srcObject = null; }
     say("The camera was not opened: " + (n === "NotAllowedError" ? "permission was not given." : n === "NotFoundError" || n === "OverconstrainedError" ? "no camera was found." : n === "NotReadableError" ? "another app may be using it." : !navigator.mediaDevices ? "this page must be opened over https or from localhost." : "the browser refused (" + (n || "unknown") + ")."));
   }
 }
@@ -192,12 +204,12 @@ canvas.addEventListener("pointermove", (ev) => {
   else if (dragging.kind === "lineAll") { const dx = (p.x - dragging.p0.x) / p.w, dy = (p.y - dragging.p0.y) / p.h; line = { x1: clamp01(dragging.l0.x1 + dx), y1: clamp01(dragging.l0.y1 + dy), x2: clamp01(dragging.l0.x2 + dx), y2: clamp01(dragging.l0.y2 + dy) }; }
   window.__seedeep.line = line; window.__seedeep.zone = zone; needsRedraw = true;
 });
-const endDrag = (ev) => { if (!dragging) return; dragging = null; try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {} remember(); };
+const endDrag = (ev) => { if (!dragging) return; if (dragging.kind === "zone") tracker.events.push([Math.max(0, lastT), "", "", "zone moved", "", pass]); else tracker.events.push([Math.max(0, lastT), "", "", "line moved", "", pass]); dragging = null; try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {} remember(); };
 canvas.addEventListener("pointerup", endDrag); canvas.addEventListener("pointercancel", endDrag);
 function remember() { try { localStorage.setItem(STORE_KEY, JSON.stringify({ line, zone, lineOn })); } catch (e) {} }
 function recall() { try { const s = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); if (s && s.line) { line = s.line; zone = s.zone || null; lineOn = !!s.lineOn; } } catch (e) {} }
-function setLineOn(on) { lineOn = on; $("btn-line").setAttribute("aria-pressed", String(on)); $("x-row").hidden = !on; window.__seedeep.lineOn = on; if (on) say("Drag the ends of the line, or the line itself."); else say(""); remember(); needsRedraw = true; }
-function setZone(poly) { zone = poly; tracker.newZone(video.currentTime); $("btn-zone").setAttribute("aria-pressed", String(!!poly)); $("btn-zone").textContent = poly ? "Remove the zone" : "Add a zone"; $("z-row").hidden = !poly; window.__seedeep.zone = poly; if (poly) say("Drag the corners of the zone."); remember(); needsRedraw = true; }
+function setLineOn(on) { lineOn = on; $("btn-line").setAttribute("aria-pressed", String(on)); $("x-row").hidden = !on; window.__seedeep.lineOn = on; if (on) say("Drag the ends of the line, or the line itself."); else if (status.textContent.startsWith("Drag the ends")) say(""); remember(); needsRedraw = true; }
+function setZone(poly) { const t_now = Math.max(0, lastT); if (zone) zoneHistory.push({ corners: zone, entered: tracker.zoneEntered, meanStay: tracker.meanStay(t_now), until: t_now, pass }); zone = poly; tracker.newZone(t_now); $("btn-zone").setAttribute("aria-pressed", String(!!poly)); $("btn-zone").textContent = poly ? "Remove the zone" : "Add a zone"; $("z-row").hidden = !poly; window.__seedeep.zone = poly; if (poly) say("Drag the corners of the zone."); else if (status.textContent.startsWith("Drag the corners")) say(""); remember(); needsRedraw = true; }
 
 function csv() {
   const rows = [["second", "people_in_frame_max", "vehicles_in_frame_max", "other_in_frame_max", "in_zone_max", "frames_seen", "pass"]];
@@ -205,8 +217,9 @@ function csv() {
   rows.push([]); rows.push(["seen_so_far_by_class"]); for (const [c, n] of Object.entries(tracker.seen)) rows.push([c, n]);
   rows.push([]); rows.push(["line_crossings", "down", "up"]); rows.push(["person", tracker.crossings.person.down, tracker.crossings.person.up]); rows.push(["vehicle", tracker.crossings.vehicle.down, tracker.crossings.vehicle.up]);
   rows.push(["line_from_to_fractions", line.x1.toFixed(3), line.y1.toFixed(3), line.x2.toFixed(3), line.y2.toFixed(3), lineOn ? "on" : "off"]);
-  if (zone) { rows.push([]); rows.push(["zone_entered", tracker.zoneEntered]); rows.push(["zone_mean_stay_s", tracker.meanStay(video.currentTime).toFixed(1)]); rows.push(["zone_corners_fractions"].concat(zone.flatMap((p) => [p.x.toFixed(3), p.y.toFixed(3)]))); }
-  rows.push([]); rows.push(["events", "second", "group", "class", "what", "track"]); for (const e of tracker.events) rows.push(["", e[0].toFixed(2), e[1], e[2], e[3], e[4]]);
+  zoneHistory.forEach((z, i) => { rows.push([]); rows.push(["earlier_zone", i + 1, "until_second", z.until.toFixed(2), "pass", z.pass]); rows.push(["earlier_zone_entered", z.entered]); rows.push(["earlier_zone_mean_stay_s", z.meanStay.toFixed(1)]); rows.push(["earlier_zone_corners_fractions"].concat(z.corners.flatMap((p) => [p.x.toFixed(3), p.y.toFixed(3)]))); });
+  if (zone) { rows.push([]); rows.push(["zone_entered", tracker.zoneEntered]); rows.push(["zone_mean_stay_s", tracker.meanStay(Math.max(0, lastT)).toFixed(1)]); rows.push(["zone_corners_fractions"].concat(zone.flatMap((p) => [p.x.toFixed(3), p.y.toFixed(3)]))); }
+  rows.push([]); rows.push(["events", "second", "group", "class", "what", "track", "pass"]); for (const e of tracker.events) rows.push(["", e[0].toFixed(2), e[1], e[2], e[3], e[4], e[5]]);
   rows.push([]); rows.push(["source", source]); rows.push(["detector", "EfficientDet-Lite0 via MediaPipe Tasks Vision, " + (window.__seedeep.delegate || "") + " delegate, threshold 0.4"]); rows.push(["made", new Date().toISOString()]);
   const text = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
   const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" })); a.download = "seedeep_counts.csv"; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
@@ -242,4 +255,4 @@ async function applyConfig() {
 running = true; requestAnimationFrame(loop);
 applyConfig().then(() => { $("btn-line").setAttribute("aria-pressed", String(lineOn)); $("x-row").hidden = !lineOn; window.__seedeep.lineOn = lineOn; window.__seedeep.line = line; if (zone) { $("btn-zone").setAttribute("aria-pressed", "true"); $("btn-zone").textContent = "Remove the zone"; $("z-row").hidden = false; window.__seedeep.zone = zone; } })
   .then(load).then(() => (CONFIG && CONFIG.start === "camera" ? useCamera() : useSample()))
-  .catch((e) => say("The detector could not load: " + (e && e.message ? e.message.slice(0, 120) : e) + ". A browser with WebAssembly is needed."));
+  .catch((e) => say("The detector could not load: " + (e && e.message ? e.message.slice(0, 120) : e) + ". A browser with WebAssembly is needed; if you serve this page yourself, run fetch_assets.sh first."));

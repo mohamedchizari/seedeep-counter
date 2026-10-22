@@ -95,6 +95,11 @@ class Tracking(unittest.TestCase):
         self.assertEqual(tr.cross['person'], [1, 1])
         self.assertEqual([e[3] for e in tr.events], ['down', 'up'])
 
+    def test_crossing_on_the_third_hit_is_counted(self):
+        # centres 280, 290, 302: the line at 300 is passed between the second and the third hit
+        tr = Tracker(); self.walk(tr, 'person', [240, 250, 262], line_y=300)
+        self.assertEqual(tr.cross['person'], [1, 0])
+
     def test_crossing_too_early_is_not_counted(self):
         # the centre passes the line between the first and second frame, before the track has 3 hits
         tr = Tracker(); self.walk(tr, 'person', [250, 270, 275, 280], line_y=300)
