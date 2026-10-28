@@ -8,15 +8,22 @@ set -euo pipefail
 cd "$(dirname "$0")"
 MODEL_URL="https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"
 NPM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21"
+TMP_FILES=()
+cleanup() { for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do rm -f -- "$f"; done; }  # the form bash 3.2 (macOS) accepts for an empty array under set -u
+trap cleanup EXIT
+FILE_MODE="$(printf '%o' $(( 0666 & ~0$(umask) )))"  # the mode a new file gets under the user's umask (mktemp makes 600)
 
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 get() { # url, destination, expected sha256
   mkdir -p "$(dirname "$2")"
   if [ -f "$2" ] && [ "$(sha "$2")" = "$3" ]; then echo "ok (already here)  $2"; return; fi
-  curl -fsSL "$1" -o "$2.part"
-  got="$(sha "$2.part")"
-  if [ "$got" != "$3" ]; then echo "CHECKSUM MISMATCH  $2: expected $3, got $got (the file was not kept)" >&2; rm -f "$2.part"; exit 1; fi
-  mv "$2.part" "$2"; echo "ok                 $2"
+  tmp="$(mktemp "$2.part.XXXXXX")"
+  TMP_FILES+=("$tmp")
+  curl -fsSL "$1" -o "$tmp"
+  got="$(sha "$tmp")"
+  if [ "$got" != "$3" ]; then echo "CHECKSUM MISMATCH  $2: expected $3, got $got (the file was not kept)" >&2; exit 1; fi
+  chmod "$FILE_MODE" "$tmp"
+  mv "$tmp" "$2"; echo "ok                 $2"
 }
 
 get "$MODEL_URL" models/efficientdet_lite0.tflite 4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993
@@ -24,10 +31,14 @@ mkdir -p web/models
 if [ -f web/models/efficientdet_lite0.tflite ] && [ "$(sha web/models/efficientdet_lite0.tflite)" = 4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993 ]; then
   echo "ok (already here)  web/models/efficientdet_lite0.tflite"  # also when web/models is a link to models
 else
-  cp models/efficientdet_lite0.tflite web/models/efficientdet_lite0.tflite  # on its own line, so set -e stops the script if it fails
-  if [ "$(sha web/models/efficientdet_lite0.tflite)" != 4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993 ]; then
+  tmp="$(mktemp web/models/efficientdet_lite0.tflite.part.XXXXXX)"
+  TMP_FILES+=("$tmp")
+  cp models/efficientdet_lite0.tflite "$tmp"  # on its own line, so set -e stops the script if it fails
+  if [ "$(sha "$tmp")" != 4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993 ]; then
     echo "COPY CHECK FAILED  web/models/efficientdet_lite0.tflite" >&2; exit 1
   fi
+  chmod "$FILE_MODE" "$tmp"
+  mv "$tmp" web/models/efficientdet_lite0.tflite
   echo "ok (copied)        web/models/efficientdet_lite0.tflite"
 fi
 get "$NPM/vision_bundle.mjs" web/vendor/vision_bundle.mjs 40f4123dfcd75cfa58add046919cc6f52fde66f009ff582997c09ba54c6ba27c

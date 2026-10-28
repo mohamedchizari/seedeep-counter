@@ -22,7 +22,7 @@ def ctrl_c():
 
 try:
     if signal.getsignal(signal.SIGINT) is signal.default_int_handler: signal.signal(signal.SIGINT, _early_int)  # an ignored Ctrl-C stays ignored
-    import argparse, contextlib, csv, errno, hashlib, json, stat, time, subprocess, datetime, shutil
+    import argparse, contextlib, csv, hashlib, json, stat, time, subprocess, datetime, shutil
     try:
         import fcntl  # locks the output folder while a run writes into it; Windows has no fcntl, and there a second run is not stopped
     except ImportError:
@@ -35,7 +35,9 @@ try:
         import reportlab  # used for summary.pdf; checked here so a missing one stops the run before it starts
     except ImportError:
         reportlab = None
+    from output_mark import check, format_row, matches_mark, parse_records, record_of_fd
     from tracker import Tracker, group, VEHICLES
+    from video_timing import effective_fps
 except BaseException as e:  # a Ctrl-C during the imports ends the run, also when a library swallowed or replaced its exception
     if GOT or isinstance(e, KeyboardInterrupt): ctrl_c()
     raise
@@ -46,22 +48,18 @@ MODEL = os.path.join(HERE, '..', 'models', 'efficientdet_lite0.tflite')
 COL = {'person': (22, 165, 242), 'vehicle': (166, 163, 31), 'other': (168, 152, 138)}  # BGR of #f2a516, #1fa3a6, #8a98a8
 FFMPEG_MIN_TIMEOUT_S = 300  # an ffmpeg still running after this, or after ten times the video's length if that is longer, is stopped
 PDF_CLASSES = 16  # classes listed by name in summary.pdf; seen_by_class.csv has them all
-MARK = '.seedeep-counter-output'  # written in every output folder: it lists the files this program put there, with their sizes and times
+MARK = '.seedeep-counter-output'  # written in every output folder: it lists the files this program put there, with their sizes and SHA-256 content hashes
 WORK = '.seedeep-counter-work'  # this run's files, until they are moved into place
 WORK_TAG = 'made-by-count_video.txt'  # written in every work folder; a run deletes a work folder only when this file is in it or the folder is empty
 TAG_TEXT = 'Made by count_video.py for one run. The next run into the folder above deletes this folder.\n'
 LITE0_SHA256 = '4b59100025bea1235a84c1038879a6cccc9f6c49f5e41144e91e74d99e780993'  # efficientdet_lite0.tflite, as fetch_assets.sh checks it
 
 def listed(out):
-    """The files the mark in OUT_DIR says this program put there: {name: (size, modified time in ns)}; {} without a mark, None
-    when the mark is there but cannot be read."""
+    """The files the mark in OUT_DIR says this program put there; {} without a mark, None when it cannot be read."""
     try: rows = open(os.path.join(out, MARK), encoding='utf-8', errors='replace').read().splitlines()[1:]
     except FileNotFoundError: return {}
     except OSError: return None
-    return {r[0]: (int(r[1]), int(r[2])) for r in (row.split('\t') for row in rows) if len(r) == 3 and r[1].isascii() and r[1].isdigit() and r[2].isascii() and r[2].isdigit()}
-
-def stamp(path):
-    st = os.stat(path); return (st.st_size, st.st_mtime_ns)
+    return parse_records(rows)
 
 def inside(path, folder):
     """True if path is folder or in it, compared as files, so a different spelling or a link is caught."""
@@ -203,6 +201,9 @@ def main():
         print(a.inp, 'is not a regular file (a folder, a FIFO, which a pipe is too, or a device) - give a video file'); sys.exit(2)
     cap = cv2.VideoCapture(a.inp)
     if not cap.isOpened(): print('cannot open', a.inp); sys.exit(2)
+    try: fps = effective_fps(cap.get(cv2.CAP_PROP_FPS))
+    except ValueError as e:
+        cap.release(); print(a.inp, '-', str(e)); sys.exit(2)
     opts = vision.ObjectDetectorOptions(base_options=mptasks.BaseOptions(model_asset_path=a.model), running_mode=vision.RunningMode.VIDEO, score_threshold=0.4, max_results=25)
     try: det = vision.ObjectDetector.create_from_options(opts)  # before the output folder is made, so a bad model leaves no empty folder
     except Exception as e: print('the detector could not be made from', a.model, '-', str(e)[:200]); sys.exit(2)
@@ -230,9 +231,12 @@ def main():
         print('the input is one of the files this run writes in', a.out, '- choose another output folder'); sys.exit(2)
     marks = listed(a.out)
     if marks is None: print(a.out, 'holds', MARK, 'but it cannot be read - check its permissions, or choose another output folder'); sys.exit(2)
-    def ours(name):  # the file under that name in OUT_DIR is one this program put there, unchanged in size and modified time since
-        p = os.path.join(a.out, name); return os.path.isfile(p) and not os.path.islink(p) and marks.get(name) == stamp(p)
+    def ours(name):
+        return matches_mark(os.path.join(a.out, name), marks.get(name, ()))
     foreign = [n for n in present if not ours(n)]
+    unread = [n for n in foreign if check(os.path.join(a.out, n), marks.get(n, ())) == 'unreadable']
+    if unread:
+        print(a.out, 'holds', ', '.join(unread), 'that its', MARK, 'file lists but that cannot be read now (its permissions, say, or a file kept only in the cloud while offline) - make them readable, or choose another output folder'); sys.exit(2)
     if foreign:
         print(a.out, 'holds', ', '.join(foreign), 'that this program did not put there or that changed since (its', MARK, 'file lists what it put there) - move them, or choose an empty or new output folder'); sys.exit(2)
     ff = shutil.which(a.ffmpeg) if a.ffmpeg else None
@@ -278,8 +282,11 @@ def main():
         try: st = os.lstat(os.path.join(work, name)) if wfd is None else os.stat(name, dir_fd=wfd, follow_symlinks=False)
         except FileNotFoundError: return False
         return stat.S_ISREG(st.st_mode)
-    def wstamp(name):  # its size and modified time, which a move into OUT_DIR keeps
-        st = os.lstat(os.path.join(work, name)) if wfd is None else os.stat(name, dir_fd=wfd, follow_symlinks=False); return (st.st_size, st.st_mtime_ns)
+    def wstamp(name):  # its size and SHA-256, read through the work folder without following a link; a move into OUT_DIR, and a later copy of OUT_DIR, keep both
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+        fd = os.open(os.path.join(work, name), flags) if wfd is None else os.open(name, flags, dir_fd=wfd)
+        try: return record_of_fd(fd)
+        finally: os.close(fd)
     def wremove(name):
         if wfd is None: still_ours(); os.remove(os.path.join(work, name))
         else: os.unlink(name, dir_fd=wfd)
@@ -287,7 +294,7 @@ def main():
         if wfd is None: still_ours(); os.replace(os.path.join(work, name), os.path.join(work, dst) if inside else dst)
         else: os.replace(name, dst, src_dir_fd=wfd, dst_dir_fd=wfd if inside else None)
     raw, final = os.path.join(work, '_annotated_raw.mp4'), os.path.join(work, 'annotated.mp4')
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25; W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     limit = a.max_minutes * 60  # stop at the end of the file or here; the frame count in a file's header can be wrong or negative
     line_y = H * a.line if a.line else 0
     writer = None
@@ -383,8 +390,8 @@ def main():
             elif n in marks and os.path.lexists(os.path.join(a.out, n)): kept.append(n)  # changed since this run moved it
         try:
             with wopen(MARK, 'w', check=False, encoding='utf-8') as f:
-                f.write('This folder holds the outputs of count_video.py. A new run into it replaces or deletes the files listed here (name, size, modified time in ns), and only while their size and modified time are unchanged.\n')
-                f.writelines(f'{n}\t{after[n][0]}\t{after[n][1]}\n' for n in OUTPUTS if n in after)
+                f.write('This folder holds the outputs of count_video.py. A new run into it replaces or deletes the files listed here (name, size, SHA-256 of the content), and only while their content is unchanged.\n')
+                f.writelines(format_row(n, after[n]) + '\n' for n in OUTPUTS if n in after)
         except OSError as e:
             print(MARK, 'could not be written in', work, '(' + (e.strerror or str(e)) + ') - nothing more was moved into', a.out, flush=True); sys.exit(2)
         with no_stop():
